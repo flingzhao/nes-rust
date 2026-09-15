@@ -9,8 +9,9 @@ pub struct Bus {
 
 impl Bus {
     pub fn new() -> Self {
-        let ram: [u8; CPU_RAM_SIZE] = [0u8; CPU_RAM_SIZE];
-        Self { ram }
+        Self {
+            ram: [0; CPU_RAM_SIZE],
+        }
     }
 
     pub fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
