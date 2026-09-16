@@ -95,6 +95,87 @@ impl TryFrom<&[u8]> for InesHeader {
     }
 }
 
+#[derive(Debug)]
+pub enum ChrMemory {
+    Rom(Vec<u8>),
+    Ram(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub struct Cartridge {
+    header: InesHeader,
+    trainer: Option<Vec<u8>>,
+    prg_rom: Vec<u8>,
+    chr: ChrMemory,
+}
+
+impl TryFrom<&[u8]> for Cartridge {
+    type Error = String;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let header = InesHeader::try_from(bytes.get(0..16).ok_or_else(|| {
+            format!(
+                "cartridge header requires at least 16 bytes, got {}",
+                bytes.len()
+            )
+        })?)?;
+
+        if header.mapper_id != 0 {
+            return Err(format!(
+                "mapper_id {} has not implemented.",
+                header.mapper_id
+            ));
+        }
+
+        if !matches!(header.prg_rom_size, 16_384 | 32_768) {
+            return Err(format!("Unsupported PRG ROM size: {}", header.prg_rom_size));
+        }
+
+        if !matches!(header.chr_rom_size, 0 | 8_192) {
+            return Err(format!("Unsupported CHR ROM size: {}", header.chr_rom_size));
+        }
+
+        let mut offset = 16_usize;
+
+        let mut trainer: Option<Vec<u8>> = None;
+
+        if header.has_trainer {
+            trainer = Some(
+                bytes
+                    .get(offset..offset + 512)
+                    .ok_or_else(|| "fail to parse cartridge trainer".to_string())?
+                    .to_vec(),
+            );
+            offset += 512;
+        }
+
+        let prg_rom = bytes
+            .get(offset..offset + header.prg_rom_size)
+            .ok_or_else(|| "fail to parse cartridge prg_rom".to_string())?
+            .to_vec();
+
+        offset += header.prg_rom_size;
+
+        let chr = if header.chr_rom_size != 0 {
+            ChrMemory::Rom(
+                bytes
+                    .get(offset..offset + header.chr_rom_size)
+                    .ok_or_else(|| "fail to parse cartridge chr_rom".to_string())?
+                    .to_vec(),
+            )
+        } else {
+            ChrMemory::Ram(vec![0; 8192])
+        };
+
+        Ok(Self {
+            header,
+            trainer,
+            prg_rom,
+            chr,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +214,77 @@ mod tests {
         assert_eq!(header.mirroring, Mirroring::Vertical);
         assert!(header.has_battery);
         assert!(header.has_trainer);
+    }
+
+    fn make_rom(has_trainer: bool, chr_banks: u8) -> Vec<u8> {
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(b"NES\x1A");
+        header[4] = 1; // 16 KiB PRG
+        header[5] = chr_banks;
+
+        if has_trainer {
+            header[6] |= 0x04;
+        }
+
+        let mut bytes = header.to_vec();
+
+        if has_trainer {
+            bytes.extend_from_slice(&[0xCC; 512]);
+        }
+
+        bytes.extend_from_slice(&[0xAA; 16 * 1024]);
+
+        if chr_banks != 0 {
+            bytes.extend(vec![0xBB; usize::from(chr_banks) * 8 * 1024]);
+        }
+
+        bytes
+    }
+
+    #[test]
+    fn loads_trainer_prg_and_chr_without_mixing_them() {
+        let bytes = make_rom(true, 1);
+        let cart = Cartridge::try_from(bytes.as_slice()).unwrap();
+
+        assert_eq!(cart.header.mapper_id, 0);
+        assert_eq!(cart.trainer.as_deref(), Some(&[0xCC; 512][..]));
+        assert_eq!(cart.prg_rom.as_slice(), &[0xAA; 16 * 1024]);
+
+        match &cart.chr {
+            ChrMemory::Rom(data) => {
+                assert_eq!(data.as_slice(), &[0xBB; 8 * 1024]);
+            }
+            ChrMemory::Ram(_) => panic!("Expected CHR ROM"),
+        }
+    }
+
+    #[test]
+    fn allocates_chr_ram_when_chr_rom_is_absent() {
+        let bytes = make_rom(false, 0);
+        let cart = Cartridge::try_from(bytes.as_slice()).unwrap();
+
+        assert!(cart.trainer.is_none());
+
+        match &cart.chr {
+            ChrMemory::Ram(data) => {
+                assert_eq!(data.len(), 8 * 1024);
+                assert!(data.iter().all(|&byte| byte == 0));
+            }
+            ChrMemory::Rom(_) => panic!("Expected CHR RAM"),
+        }
+    }
+
+    #[test]
+    fn rejects_every_truncated_prefix() {
+        let bytes = make_rom(true, 1);
+
+        for end in 0..bytes.len() {
+            assert!(
+                Cartridge::try_from(&bytes[..end]).is_err(),
+                "Unexpected success for {end} bytes"
+            );
+        }
+
+        assert!(Cartridge::try_from(bytes.as_slice()).is_ok());
     }
 }
