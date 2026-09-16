@@ -287,4 +287,35 @@ mod tests {
 
         assert!(Cartridge::try_from(bytes.as_slice()).is_ok());
     }
+
+    #[test]
+    fn rejects_unsupported_chr_sizes() {
+        let bytes = make_rom(true, 2);
+
+        assert!(Cartridge::try_from(bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_prg_sizes() {
+        for prg_banks in [0u8, 3] {
+            let mut bytes = make_rom(false, 0);
+            bytes[4] = prg_banks;
+
+            // 无 Trainer、无 CHR ROM，调整为头部声明的完整长度。
+            bytes.resize(16 + usize::from(prg_banks) * 16 * 1024, 0xAA);
+
+            assert!(
+                Cartridge::try_from(bytes.as_slice()).is_err(),
+                "Should reject {prg_banks} PRG banks"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_mapper() {
+        let mut bytes = make_rom(false, 1);
+        bytes[6] = 0x10; // Mapper 1，其他标志为 0
+
+        assert!(Cartridge::try_from(bytes.as_slice()).is_err());
+    }
 }
