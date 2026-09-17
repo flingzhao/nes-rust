@@ -109,6 +109,24 @@ pub struct Cartridge {
     chr: ChrMemory,
 }
 
+impl Cartridge {
+    pub fn cpu_read(&self, addr: u16) -> Result<u8, String> {
+        if addr < 0x8000 {
+            return Err(format!("Address outside PRG ROM region: {addr:#06X}"));
+        }
+
+        let relative = usize::from(addr - 0x8000);
+
+        let mask = if self.prg_rom.len() == 16 * 1024 {
+            0x3FFF
+        } else {
+            0x7FFF
+        };
+
+        Ok(self.prg_rom[relative & mask])
+    }
+}
+
 impl TryFrom<&[u8]> for Cartridge {
     type Error = String;
 

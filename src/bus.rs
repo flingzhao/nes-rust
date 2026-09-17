@@ -1,3 +1,5 @@
+use crate::cartridge::{self, Cartridge};
+
 const CPU_RAM_SIZE: usize = 0x800;
 // const NES_PPU_REG_ADDR: usize = 0x2000;
 const CPU_RAM_MAPPED_END: u16 = 0x1FFF;
@@ -5,21 +7,37 @@ const CPU_RAM_MIRROR_MASK: u16 = 0x07FF;
 
 pub struct Bus {
     ram: [u8; CPU_RAM_SIZE],
+    cartridge: Option<Cartridge>,
 }
 
 impl Bus {
     pub fn new() -> Self {
         Self {
             ram: [0; CPU_RAM_SIZE],
+            cartridge: None,
         }
     }
 
+    pub fn insert_cartridge(&mut self, cartridge: Cartridge) {
+        self.cartridge = Some(cartridge);
+    }
+
     pub fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
-        if addr > CPU_RAM_MAPPED_END {
-            return Err(format!("unimplemented address {addr:#06X}"));
+        match addr {
+            0x0000..=0x1FFF => {
+                let index = usize::from(addr & CPU_RAM_MIRROR_MASK);
+                Ok(self.ram[index])
+            }
+            0x8000..=0xFFFF => {
+                let cartridge = self
+                    .cartridge
+                    .as_ref()
+                    .ok_or_else(|| "No cartridge inserted".to_string())?;
+
+                cartridge.cpu_read(addr)
+            }
+            _ => Err("unimplemented addr access".to_string()),
         }
-        let index = usize::from(addr & CPU_RAM_MIRROR_MASK);
-        Ok(self.ram[index])
     }
 
     pub fn cpu_write(&mut self, addr: u16, data: u8) -> Result<(), String> {
