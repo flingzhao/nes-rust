@@ -62,6 +62,39 @@ impl Cpu {
 
         Ok(())
     }
+
+    fn fetch_byte(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        let value = bus.cpu_read(self.pc)?;
+        self.pc = self.pc.wrapping_add(1);
+        Ok(value)
+    }
+
+    pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        let instruction_pc = self.pc;
+        let opcode = self.fetch_byte(bus)?;
+        match opcode {
+            0xA9 => {
+                let value = self.fetch_byte(bus)?;
+                self.a = value;
+                self.update_zero_negative(value);
+                Ok(2)
+            }
+            0xAA => {
+                self.x = self.a;
+                self.update_zero_negative(self.x);
+                Ok(2)
+            }
+            0xE8 => {
+                self.x = self.x.wrapping_add(1);
+                self.update_zero_negative(self.x);
+                Ok(2)
+            }
+            0xEA => Ok(2),
+            _ => Err(format!(
+                "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +183,97 @@ mod tests {
         assert_eq!(cpu.pc, 0x1234);
         assert_eq!(cpu.sp, 0x80);
         assert_eq!(cpu.status, FLAG_U | FLAG_C);
+    }
+
+    fn bus_with_ram_program(program: &[u8]) -> Bus {
+        assert!(program.len() <= 0x800);
+
+        let mut bus = Bus::new();
+
+        for (address, &byte) in program.iter().enumerate() {
+            bus.cpu_write(address as u16, byte).unwrap();
+        }
+
+        bus
+    }
+
+    #[test]
+    fn executes_first_program() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0xA9, 0xFF, // LDA #$FF
+            0xAA, // TAX
+            0xE8, // INX
+            0xEA, // NOP
+        ]);
+
+        cpu.pc = 0;
+        cpu.set_flag(FLAG_C, true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.a, 0xFF);
+        assert_eq!(cpu.pc, 2);
+        assert!(cpu.flag(FLAG_N));
+        assert!(!cpu.flag(FLAG_Z));
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.x, 0xFF);
+        assert_eq!(cpu.pc, 3);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.x, 0);
+        assert_eq!(cpu.pc, 4);
+        assert!(cpu.flag(FLAG_Z));
+        assert!(!cpu.flag(FLAG_N));
+        assert!(cpu.flag(FLAG_C));
+
+        let before = (cpu.a, cpu.x, cpu.y, cpu.sp, cpu.status);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.pc, 5);
+        assert_eq!((cpu.a, cpu.x, cpu.y, cpu.sp, cpu.status), before);
+    }
+
+    #[test]
+    fn lda_updates_zero_and_negative_flags() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[0xA9, 0x80, 0xA9, 0x00, 0xA9, 0x7F]);
+
+        cpu.pc = 0;
+
+        for (value, zero, negative) in [
+            (0x80, false, true),
+            (0x00, true, false),
+            (0x7F, false, false),
+        ] {
+            cpu.step(&mut bus).unwrap();
+
+            assert_eq!(cpu.a, value);
+            assert_eq!(cpu.flag(FLAG_Z), zero);
+            assert_eq!(cpu.flag(FLAG_N), negative);
+        }
+    }
+
+    #[test]
+    fn reports_unsupported_opcode_and_its_address() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[0x02]);
+
+        cpu.pc = 0;
+
+        let error = cpu.step(&mut bus).unwrap_err();
+
+        assert!(error.contains("0x02"));
+        assert!(error.contains("0x0000"));
+    }
+
+    #[test]
+    fn failed_fetch_does_not_advance_pc() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+
+        cpu.pc = 0x8000; // 未插卡
+        assert!(cpu.fetch_byte(&mut bus).is_err());
+        assert_eq!(cpu.pc, 0x8000);
     }
 }
