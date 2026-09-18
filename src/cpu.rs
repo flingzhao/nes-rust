@@ -1,5 +1,3 @@
-use std::ops::Sub;
-
 use crate::bus::Bus;
 
 const FLAG_C: u8 = 0x01; // Carry
@@ -75,6 +73,24 @@ impl Cpu {
         Ok(u16::from_le_bytes([low, high]))
     }
 
+    fn branch(&mut self, bus: &mut Bus, condition: bool) -> Result<u8, String> {
+        let offset = self.fetch_byte(bus)? as i8;
+        if !condition {
+            return Ok(2);
+        }
+        let base = self.pc;
+        let target = base.wrapping_add_signed(i16::from(offset));
+
+        let crossed_page = (base & 0xFF00) != (target & 0xFF00);
+        self.pc = target;
+
+        if !crossed_page {
+            return Ok(3);
+        } else {
+            return Ok(4);
+        }
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -116,6 +132,21 @@ impl Cpu {
                 self.x = self.x.wrapping_add(1);
                 self.update_zero_negative(self.x);
                 Ok(2)
+            }
+            0xD0 => {
+                let condition = !self.flag(FLAG_Z);
+                self.branch(bus, condition)
+            }
+            0xF0 => {
+                let condition = self.flag(FLAG_Z);
+                self.branch(bus, condition)
+            }
+            0x4C => {
+                // fetch_word 取得目标地址。
+                // 将 PC 设置为目标地址，返回 3 个周期。
+                let target_addr = self.fetch_word(bus)?;
+                self.pc = target_addr;
+                Ok(3)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -402,5 +433,89 @@ mod tests {
 
         // 操作码和两个地址字节已经读取，写入失败不会回滚 PC。
         assert_eq!(cpu.pc, 3);
+    }
+
+    #[test]
+    fn executes_loop_until_x_wraps_to_zero() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0xA9, 0xFE, // 0000: LDA #$FE
+            0xAA, // 0002: TAX
+            0xE8, // 0003: INX
+            0xD0, 0xFD, // 0004: BNE -3 → 0003
+            0xEA, // 0006: NOP
+        ]);
+
+        cpu.pc = 0;
+
+        // 周期数、执行后的 PC、X
+        let expected = [
+            (2u8, 2u16, 0x00u8), // LDA
+            (2, 3, 0xFE),        // TAX
+            (2, 4, 0xFF),        // INX
+            (3, 3, 0xFF),        // BNE：跳转
+            (2, 4, 0x00),        // INX：回绕
+            (2, 6, 0x00),        // BNE：不跳转
+            (2, 7, 0x00),        // NOP
+        ];
+
+        for (cycles, pc, x) in expected {
+            assert_eq!(cpu.step(&mut bus).unwrap(), cycles);
+            assert_eq!(cpu.pc, pc);
+            assert_eq!(cpu.x, x);
+        }
+
+        assert_eq!(cpu.a, 0xFE);
+        assert!(cpu.flag(FLAG_Z));
+    }
+
+    #[test]
+    fn beq_uses_post_operand_pc_and_correct_cycles() {
+        let cases = [
+            // 起始 PC、偏移、Z、目标 PC、周期数
+            (0x0000u16, 0x03u8, false, 0x0002u16, 2u8),
+            (0x0000, 0x03, true, 0x0005, 3),
+            (0x00FD, 0x01, true, 0x0100, 4),
+            (0x0100, 0xFD, true, 0x00FF, 4),
+            // 指令跨页，但分支基准和目标都在 0x01xx。
+            (0x00FE, 0x01, true, 0x0101, 3),
+        ];
+
+        for (start, offset, zero, target, cycles) in cases {
+            let mut cpu = Cpu::new();
+            let mut bus = Bus::new();
+
+            bus.cpu_write(start, 0xF0).unwrap();
+            bus.cpu_write(start + 1, offset).unwrap();
+
+            cpu.pc = start;
+            cpu.set_flag(FLAG_Z, zero);
+            let original_status = cpu.status;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), cycles);
+            assert_eq!(cpu.pc, target);
+            assert_eq!(cpu.status, original_status);
+        }
+    }
+
+    #[test]
+    fn absolute_jmp_skips_instructions() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0x4C, 0x05, 0x00, // JMP $0005
+            0xA9, 0x11, // 应跳过
+            0xA9, 0x42, // 目标指令
+        ]);
+
+        cpu.pc = 0;
+        let original_status = cpu.status;
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 3);
+        assert_eq!(cpu.pc, 5);
+        assert_eq!(cpu.status, original_status);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.a, 0x42);
+        assert_eq!(cpu.pc, 7);
     }
 }
