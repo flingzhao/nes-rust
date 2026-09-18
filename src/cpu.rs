@@ -69,10 +69,32 @@ impl Cpu {
         Ok(value)
     }
 
+    fn fetch_word(&mut self, bus: &mut Bus) -> Result<u16, String> {
+        let low = self.fetch_byte(bus)?;
+        let high = self.fetch_byte(bus)?;
+        Ok(u16::from_le_bytes([low, high]))
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
         match opcode {
+            0x85 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                bus.cpu_write(addr, self.a)?;
+                Ok(3)
+            }
+            0x8D => {
+                let addr = self.fetch_word(bus)?;
+                bus.cpu_write(addr, self.a)?;
+                Ok(4)
+            }
+            0xA5 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                self.a = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.a);
+                Ok(3)
+            }
             0xA9 => {
                 let value = self.fetch_byte(bus)?;
                 self.a = value;
@@ -83,6 +105,12 @@ impl Cpu {
                 self.x = self.a;
                 self.update_zero_negative(self.x);
                 Ok(2)
+            }
+            0xAD => {
+                let addr = self.fetch_word(bus)?;
+                self.a = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.a);
+                Ok(4)
             }
             0xE8 => {
                 self.x = self.x.wrapping_add(1);
@@ -275,5 +303,104 @@ mod tests {
         cpu.pc = 0x8000; // 未插卡
         assert!(cpu.fetch_byte(&mut bus).is_err());
         assert_eq!(cpu.pc, 0x8000);
+    }
+
+    #[test]
+    fn loads_and_stores_through_zero_page_and_absolute_addresses() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0xA9, 0x80, // LDA #$80
+            0x85, 0x40, // STA $40
+            0xA9, 0x00, // LDA #$00
+            0xA5, 0x40, // LDA $40
+            0x8D, 0x23, 0x01, // STA $0123
+            0xA9, 0x00, // LDA #$00
+            0xAD, 0x23, 0x01, // LDA $0123
+        ]);
+
+        cpu.pc = 0;
+
+        let expected = [
+            // 周期数、执行后的 PC、A
+            (2u8, 2u16, 0x80u8),
+            (3, 4, 0x80),
+            (2, 6, 0x00),
+            (3, 8, 0x80),
+            (4, 11, 0x80),
+            (2, 13, 0x00),
+            (4, 16, 0x80),
+        ];
+
+        for (cycles, pc, a) in expected {
+            assert_eq!(cpu.step(&mut bus).unwrap(), cycles);
+            assert_eq!(cpu.pc, pc);
+            assert_eq!(cpu.a, a);
+            assert_eq!(cpu.flag(FLAG_Z), a == 0);
+            assert_eq!(cpu.flag(FLAG_N), a & 0x80 != 0);
+        }
+
+        assert_eq!(bus.cpu_read(0x0040).unwrap(), 0x80);
+        assert_eq!(bus.cpu_read(0x0123).unwrap(), 0x80);
+    }
+
+    #[test]
+    fn stores_preserve_accumulator_and_all_status_flags() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0x85, 0x40, // STA $40
+            0x8D, 0x23, 0x01, // STA $0123
+        ]);
+
+        cpu.pc = 0;
+        cpu.a = 0x80;
+        cpu.status = FLAG_U | FLAG_C | FLAG_Z | FLAG_I | FLAG_V;
+        let original_status = cpu.status;
+
+        for cycles in [3, 4] {
+            assert_eq!(cpu.step(&mut bus).unwrap(), cycles);
+            assert_eq!(cpu.a, 0x80);
+            assert_eq!(cpu.status, original_status);
+        }
+
+        assert_eq!(bus.cpu_read(0x0040).unwrap(), 0x80);
+        assert_eq!(bus.cpu_read(0x0123).unwrap(), 0x80);
+    }
+
+    #[test]
+    fn zero_page_lda_reads_address_00ff() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0xA5, 0xFF, // LDA $FF
+        ]);
+
+        cpu.pc = 0;
+        bus.cpu_write(0x00FF, 0x80).unwrap();
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 3);
+
+        assert_eq!(cpu.a, 0x80);
+        assert_eq!(cpu.pc, 2);
+        assert!(cpu.flag(FLAG_N));
+        assert!(!cpu.flag(FLAG_Z));
+    }
+
+    #[test]
+    fn absolute_sta_propagates_unsupported_address_error() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0x8D, 0x00, 0x20, // STA $2000
+        ]);
+
+        cpu.pc = 0;
+        cpu.a = 0x42;
+        let original_status = cpu.status;
+
+        assert!(cpu.step(&mut bus).is_err());
+
+        assert_eq!(cpu.a, 0x42);
+        assert_eq!(cpu.status, original_status);
+
+        // 操作码和两个地址字节已经读取，写入失败不会回滚 PC。
+        assert_eq!(cpu.pc, 3);
     }
 }
