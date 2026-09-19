@@ -8,6 +8,8 @@ const FLAG_U: u8 = 0x20; // 内部表示约定
 const FLAG_V: u8 = 0x40; // Overflow
 const FLAG_N: u8 = 0x80; // Negative
 
+const BASE_STACKPAGE: u16 = 0x0100; // 栈底指针
+
 #[derive(Debug)]
 pub struct Cpu {
     a: u8,
@@ -91,6 +93,22 @@ impl Cpu {
         }
     }
 
+    fn push_byte(&mut self, bus: &mut Bus, value: u8) -> Result<(), String> {
+        let addr = u16::from(self.sp) | BASE_STACKPAGE;
+        bus.cpu_write(addr, value)?;
+        self.sp = self.sp.wrapping_sub(1u8);
+        Ok(())
+    }
+
+    fn pop_byte(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        let next_sp = self.sp.wrapping_add(1);
+        let addr = u16::from(next_sp) | BASE_STACKPAGE;
+        let value = bus.cpu_read(addr)?;
+
+        self.sp = next_sp;
+        Ok(value)
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -147,6 +165,31 @@ impl Cpu {
                 let target_addr = self.fetch_word(bus)?;
                 self.pc = target_addr;
                 Ok(3)
+            }
+            0x48 => {
+                self.push_byte(bus, self.a)?;
+                Ok(3)
+            }
+            0x68 => {
+                self.a = self.pop_byte(bus)?;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x20 => {
+                let dst = self.fetch_word(bus)?;
+                let ret_addr = self.pc.wrapping_sub(1);
+
+                let [low, high] = ret_addr.to_le_bytes();
+                self.push_byte(bus, high)?;
+                self.push_byte(bus, low)?;
+                self.pc = dst;
+                Ok(6)
+            }
+            0x60 => {
+                let low = self.pop_byte(bus)?;
+                let high = self.pop_byte(bus)?;
+                self.pc = u16::from_le_bytes([low, high]).wrapping_add(1);
+                Ok(6)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -517,5 +560,63 @@ mod tests {
         assert_eq!(cpu.step(&mut bus).unwrap(), 2);
         assert_eq!(cpu.a, 0x42);
         assert_eq!(cpu.pc, 7);
+    }
+
+    #[test]
+    fn stack_wraps_within_page_one_and_preserves_lifo_order() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.sp = 0x00;
+
+        cpu.push_byte(&mut bus, 0x11).unwrap();
+        assert_eq!(cpu.sp, 0xFF);
+        assert_eq!(bus.cpu_read(0x0100).unwrap(), 0x11);
+
+        cpu.push_byte(&mut bus, 0x22).unwrap();
+        assert_eq!(cpu.sp, 0xFE);
+        assert_eq!(bus.cpu_read(0x01FF).unwrap(), 0x22);
+
+        assert_eq!(cpu.pop_byte(&mut bus).unwrap(), 0x22);
+        assert_eq!(cpu.pop_byte(&mut bus).unwrap(), 0x11);
+        assert_eq!(cpu.sp, 0x00);
+    }
+
+    #[test]
+    fn jsr_pushes_last_operand_address_and_rts_resumes_next_instruction() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+
+        // 0234: JSR $0300
+        // 0237: LDA #$42
+        for (i, byte) in [0x20u8, 0x00, 0x03, 0xA9, 0x42].into_iter().enumerate() {
+            bus.cpu_write(0x0234 + i as u16, byte).unwrap();
+        }
+
+        // 子程序立即返回。
+        bus.cpu_write(0x0300, 0x60).unwrap(); // RTS
+
+        cpu.pc = 0x0234;
+        cpu.sp = 0xFD;
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x0300);
+        assert_eq!(cpu.sp, 0xFB);
+
+        // JSR 必须压入 0236，而不是下一条指令的地址 0237。
+        assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x02);
+        assert_eq!(
+            bus.cpu_read(0x01FC).unwrap(),
+            0x36,
+            "JSR must push the next instruction address minus one"
+        );
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x0237);
+        assert_eq!(cpu.sp, 0xFD);
+
+        // 确认返回到操作码 A9，而不是操作数 42。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.a, 0x42);
+        assert_eq!(cpu.pc, 0x0239);
     }
 }
