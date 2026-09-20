@@ -619,4 +619,79 @@ mod tests {
         assert_eq!(cpu.a, 0x42);
         assert_eq!(cpu.pc, 0x0239);
     }
+
+    #[test]
+    fn nested_calls_restore_each_return_address() {
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+
+        let programs: [(u16, &[u8]); 3] = [
+            (
+                0x0200,
+                &[
+                    0x20, 0x00, 0x03, // JSR $0300
+                    0xEA, // NOP
+                ],
+            ),
+            (
+                0x0300,
+                &[
+                    0x20, 0x00, 0x04, // JSR $0400
+                    0x60, // RTS
+                ],
+            ),
+            (
+                0x0400,
+                &[
+                    0xA9, 0x42, // LDA #$42
+                    0x60, // RTS
+                ],
+            ),
+        ];
+
+        for (start, program) in programs {
+            for (offset, &byte) in program.iter().enumerate() {
+                bus.cpu_write(start + offset as u16, byte).unwrap();
+            }
+        }
+
+        cpu.pc = 0x0200;
+        cpu.sp = 0xFD;
+
+        // 外层 JSR：保存 0202。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x0300);
+        assert_eq!(cpu.sp, 0xFB);
+        assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x02);
+        assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x02);
+
+        // 内层 JSR：保存 0302，不覆盖外层返回位置。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x0400);
+        assert_eq!(cpu.sp, 0xF9);
+        assert_eq!(bus.cpu_read(0x01FB).unwrap(), 0x03);
+        assert_eq!(bus.cpu_read(0x01FA).unwrap(), 0x02);
+        assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x02);
+        assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x02);
+
+        let expectations = [
+            // 周期数、执行后的 PC、SP
+            (2u8, 0x0402u16, 0xF9u8), // LDA
+            (6, 0x0303, 0xFB),        // 内层 RTS
+            (6, 0x0203, 0xFD),        // 外层 RTS
+            (2, 0x0204, 0xFD),        // 主程序 NOP
+        ];
+
+        for (index, (cycles, pc, sp)) in expectations.into_iter().enumerate() {
+            assert_eq!(
+                cpu.step(&mut bus).unwrap(),
+                cycles,
+                "Cycle mismatch at remaining step {index}"
+            );
+            assert_eq!(cpu.pc, pc, "PC mismatch at step {index}");
+            assert_eq!(cpu.sp, sp, "SP mismatch at step {index}");
+        }
+
+        assert_eq!(cpu.a, 0x42);
+    }
 }
