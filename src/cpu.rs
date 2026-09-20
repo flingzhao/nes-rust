@@ -109,6 +109,40 @@ impl Cpu {
         Ok(value)
     }
 
+    fn adc(&mut self, value: u8) {
+        let c = self.flag(FLAG_C) as u16;
+        let old_a = self.a;
+        let new_a = u16::from(self.a).wrapping_add(value as u16).wrapping_add(c);
+        // 加法溢出发生在两个符号相同，但是输出符号不同
+        let overflow = (!(old_a ^ value) & (old_a ^ new_a as u8) & 0x80) != 0;
+
+        self.set_flag(FLAG_V, overflow);
+
+        let carry_in = new_a & 0x100 != 0;
+        self.set_flag(FLAG_C, carry_in);
+        self.a = new_a as u8;
+        self.update_zero_negative(self.a);
+    }
+
+    fn sbc(&mut self, value: u8) {
+        let c = self.flag(FLAG_C) as u16;
+        let old_a = self.a;
+        let new_a = u16::from(self.a)
+            .wrapping_sub(value as u16)
+            .wrapping_sub(1 - c);
+
+        // 有符号溢出，就是数学运算的正确结果，超出了当前有符号整数类型能表示的范围。
+        // 减法溢出发生在输入异号，结果相对 old_a 变号。
+        let overflow = ((old_a ^ value) & (old_a ^ new_a as u8) & 0x80) != 0;
+        self.set_flag(FLAG_V, overflow);
+
+        let carry_in = new_a & 0x100 == 0;
+        self.set_flag(FLAG_C, carry_in);
+
+        self.a = new_a as u8;
+        self.update_zero_negative(self.a);
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -190,6 +224,24 @@ impl Cpu {
                 let high = self.pop_byte(bus)?;
                 self.pc = u16::from_le_bytes([low, high]).wrapping_add(1);
                 Ok(6)
+            }
+            0x18 => {
+                self.set_flag(FLAG_C, false);
+                Ok(2)
+            }
+            0x38 => {
+                self.set_flag(FLAG_C, true);
+                Ok(2)
+            }
+            0x69 => {
+                let value = self.fetch_byte(bus)?;
+                self.adc(value);
+                Ok(2)
+            }
+            0xe9 => {
+                let value = self.fetch_byte(bus)?;
+                self.sbc(value);
+                Ok(2)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -693,5 +745,54 @@ mod tests {
         }
 
         assert_eq!(cpu.a, 0x42);
+    }
+
+    #[test]
+    fn immediate_adc_sbc_update_arithmetic_flags() {
+        let cases = [
+            // opcode, A, operand, carry_in, result, C, V
+            (0x69u8, 0x01u8, 0x01u8, false, 0x02u8, false, false),
+            (0x69, 0x01, 0x01, true, 0x03, false, false),
+            (0x69, 0xFF, 0x01, false, 0x00, true, false),
+            (0x69, 0x7F, 0x01, false, 0x80, false, true),
+            (0x69, 0x80, 0x80, false, 0x00, true, true),
+            (0x69, 0x09, 0x01, false, 0x0A, false, false),
+            (0xE9, 0x05, 0x03, true, 0x02, true, false),
+            (0xE9, 0x05, 0x03, false, 0x01, true, false),
+            (0xE9, 0x00, 0x01, true, 0xFF, false, false),
+            (0xE9, 0x00, 0x00, true, 0x00, true, false),
+            (0xE9, 0x00, 0x00, false, 0xFF, false, false),
+            (0xE9, 0x80, 0x01, true, 0x7F, true, true),
+            (0xE9, 0x7F, 0xFF, true, 0x80, false, true),
+        ];
+
+        for (index, (opcode, a, operand, carry_in, result, c, v)) in cases.into_iter().enumerate() {
+            // D=0 和 D=1 都应得到相同的二进制运算结果。
+            for decimal in [false, true] {
+                let mut cpu = Cpu::new();
+                let mut bus = bus_with_ram_program(&[opcode, operand]);
+
+                cpu.pc = 0;
+                cpu.a = a;
+                cpu.status = FLAG_U | FLAG_I | FLAG_V | FLAG_Z | FLAG_N;
+                cpu.set_flag(FLAG_C, carry_in);
+                cpu.set_flag(FLAG_D, decimal);
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+
+                assert_eq!(cpu.a, result, "A mismatch in case {index}");
+                assert_eq!(cpu.pc, 2);
+                assert_eq!(cpu.flag(FLAG_C), c, "C mismatch in case {index}");
+                assert_eq!(cpu.flag(FLAG_V), v, "V mismatch in case {index}");
+                assert_eq!(cpu.flag(FLAG_Z), result == 0);
+                assert_eq!(cpu.flag(FLAG_N), result & 0x80 != 0);
+
+                // 运算不应破坏其他标志。
+                let preserved_mask = !(FLAG_C | FLAG_V | FLAG_Z | FLAG_N);
+                let expected_preserved = FLAG_U | FLAG_I | if decimal { FLAG_D } else { 0 };
+
+                assert_eq!(cpu.status & preserved_mask, expected_preserved);
+            }
+        }
     }
 }
