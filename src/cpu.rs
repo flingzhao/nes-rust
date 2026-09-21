@@ -245,22 +245,22 @@ impl Cpu {
                 self.adc(value);
                 Ok(2)
             }
-            0xe9 => {
+            0xE9 => {
                 let value = self.fetch_byte(bus)?;
                 self.sbc(value);
                 Ok(2)
             }
-            0xc9 => {
+            0xC9 => {
                 let value = self.fetch_byte(bus)?;
                 self.compare_register(value, self.a);
                 Ok(2)
             }
-            0xe0 => {
+            0xE0 => {
                 let value = self.fetch_byte(bus)?;
                 self.compare_register(value, self.x);
                 Ok(2)
             }
-            0xc0 => {
+            0xC0 => {
                 let value = self.fetch_byte(bus)?;
                 self.compare_register(value, self.y);
                 Ok(2)
