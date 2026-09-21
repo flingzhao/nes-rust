@@ -265,6 +265,57 @@ impl Cpu {
                 self.compare_register(value, self.y);
                 Ok(2)
             }
+            0xA2 => {
+                let value = self.fetch_byte(bus)?;
+                self.x = value;
+                self.update_zero_negative(value);
+                Ok(2)
+            }
+            0xA0 => {
+                let value = self.fetch_byte(bus)?;
+                self.y = value;
+                self.update_zero_negative(value);
+                Ok(2)
+            }
+            0xA8 => {
+                self.y = self.a;
+                self.update_zero_negative(self.y);
+                Ok(2)
+            }
+            0x8A => {
+                self.a = self.x;
+                self.update_zero_negative(self.a);
+                Ok(2)
+            }
+            0x98 => {
+                self.a = self.y;
+                self.update_zero_negative(self.a);
+                Ok(2)
+            }
+            0xBA => {
+                self.x = self.sp;
+                self.update_zero_negative(self.x);
+                Ok(2)
+            }
+            0x9A => {
+                self.sp = self.x;
+                Ok(2)
+            }
+            0xCA => {
+                self.x = self.x.wrapping_sub(1);
+                self.update_zero_negative(self.x);
+                Ok(2)
+            }
+            0xC8 => {
+                self.y = self.y.wrapping_add(1);
+                self.update_zero_negative(self.y);
+                Ok(2)
+            }
+            0x88 => {
+                self.y = self.y.wrapping_sub(1);
+                self.update_zero_negative(self.y);
+                Ok(2)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -882,5 +933,178 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn immediate_index_loads_update_only_target_and_z_n() {
+        for opcode in [0xA2u8, 0xA0] {
+            for value in [0x00u8, 0x7F, 0x80, 0xFF] {
+                let mut cpu = Cpu::new();
+                let mut bus = bus_with_ram_program(&[opcode, value]);
+
+                cpu.pc = 0;
+                cpu.a = 0x11;
+                cpu.x = 0x22;
+                cpu.y = 0x33;
+                cpu.sp = 0xFD;
+                cpu.status = FLAG_U | FLAG_I | FLAG_D | FLAG_C | FLAG_V | FLAG_Z | FLAG_N;
+
+                let preserved = cpu.status & !(FLAG_Z | FLAG_N);
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+                assert_eq!(cpu.pc, 2);
+                assert_eq!(cpu.a, 0x11);
+                assert_eq!(cpu.sp, 0xFD);
+
+                if opcode == 0xA2 {
+                    assert_eq!((cpu.x, cpu.y), (value, 0x33));
+                } else {
+                    assert_eq!((cpu.x, cpu.y), (0x22, value));
+                }
+
+                assert_eq!(cpu.flag(FLAG_Z), value == 0);
+                assert_eq!(cpu.flag(FLAG_N), value & 0x80 != 0);
+                assert_eq!(cpu.status & !(FLAG_Z | FLAG_N), preserved);
+            }
+        }
+    }
+
+    #[test]
+    fn txs_preserves_flags_but_tsx_updates_zero_negative() {
+        for value in [0x00u8, 0x80, 0x7F] {
+            let mut cpu = Cpu::new();
+            let mut bus = bus_with_ram_program(&[0x9A, 0xBA]);
+
+            cpu.pc = 0;
+            cpu.x = value;
+            cpu.sp = 0xFD;
+            cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V;
+
+            // 让旧 Z、N 与 value 对应的结果相反。
+            cpu.set_flag(FLAG_Z, value != 0);
+            cpu.set_flag(FLAG_N, value & 0x80 == 0);
+            let before = cpu.status;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 2); // TXS
+            assert_eq!(cpu.sp, value);
+            assert_eq!(cpu.x, value);
+            assert_eq!(cpu.status, before);
+
+            cpu.x = 0x55; // 确保 TSX 确实从 SP 读取。
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 2); // TSX
+            assert_eq!(cpu.x, value);
+            assert_eq!(cpu.sp, value);
+            assert_eq!(cpu.pc, 2);
+
+            assert_eq!(cpu.flag(FLAG_Z), value == 0);
+            assert_eq!(cpu.flag(FLAG_N), value & 0x80 != 0);
+            assert_eq!(cpu.status & !(FLAG_Z | FLAG_N), before & !(FLAG_Z | FLAG_N));
+        }
+    }
+
+    #[test]
+    fn register_increment_decrement_wrap_and_preserve_other_flags() {
+        let cases = [
+            // opcode, initial, expected
+            (0xCAu8, 0x00u8, 0xFFu8), // DEX
+            (0xCA, 0x01, 0x00),
+            (0xC8, 0xFF, 0x00), // INY
+            (0xC8, 0x7F, 0x80),
+            (0x88, 0x00, 0xFF), // DEY
+            (0x88, 0x01, 0x00),
+        ];
+
+        for (opcode, initial, expected) in cases {
+            for initial_cv in [0u8, FLAG_C | FLAG_V] {
+                let mut cpu = Cpu::new();
+                let mut bus = bus_with_ram_program(&[opcode]);
+
+                cpu.pc = 0;
+                cpu.a = 0x11;
+                cpu.x = 0x22;
+                cpu.y = 0x33;
+                cpu.sp = 0xFD;
+                cpu.status = FLAG_U | FLAG_I | FLAG_D | initial_cv | FLAG_Z | FLAG_N;
+
+                let preserved = cpu.status & !(FLAG_Z | FLAG_N);
+
+                if opcode == 0xCA {
+                    cpu.x = initial;
+                } else {
+                    cpu.y = initial;
+                }
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+                assert_eq!(cpu.pc, 1);
+
+                if opcode == 0xCA {
+                    assert_eq!((cpu.x, cpu.y), (expected, 0x33));
+                } else {
+                    assert_eq!((cpu.x, cpu.y), (0x22, expected));
+                }
+
+                assert_eq!(cpu.a, 0x11);
+                assert_eq!(cpu.sp, 0xFD);
+                assert_eq!(cpu.flag(FLAG_Z), expected == 0);
+                assert_eq!(cpu.flag(FLAG_N), expected & 0x80 != 0);
+                assert_eq!(cpu.status & !(FLAG_Z | FLAG_N), preserved);
+            }
+        }
+    }
+
+    #[test]
+    fn register_transfer_chain_preserves_sources_and_updates_flags() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0xA2, 0x80, // LDX #$80
+            0x8A, // TXA
+            0xA8, // TAY
+            0xA0, 0x00, // LDY #$00
+            0x98, // TYA
+        ]);
+
+        cpu.pc = 0;
+        cpu.a = 0;
+        cpu.x = 0;
+        cpu.y = 0;
+        cpu.sp = 0xFD;
+        cpu.status = FLAG_U | FLAG_I | FLAG_D | FLAG_C | FLAG_V;
+
+        let preserved_flags = cpu.status;
+        let mut total_cycles = 0u32;
+
+        let expectations = [
+            // PC, A, X, Y, Z, N
+            (2u16, 0x00u8, 0x80u8, 0x00u8, false, true),
+            (3, 0x80, 0x80, 0x00, false, true),
+            (4, 0x80, 0x80, 0x80, false, true),
+            (6, 0x80, 0x80, 0x00, true, false),
+            (7, 0x00, 0x80, 0x00, true, false),
+        ];
+
+        for (index, (pc, a, x, y, z, n)) in expectations.into_iter().enumerate() {
+            let cycles = cpu.step(&mut bus).unwrap();
+            total_cycles += u32::from(cycles);
+
+            assert_eq!(cycles, 2, "Cycles at step {index}");
+            assert_eq!(cpu.pc, pc, "PC at step {index}");
+            assert_eq!(
+                (cpu.a, cpu.x, cpu.y),
+                (a, x, y),
+                "Registers at step {index}"
+            );
+            assert_eq!(cpu.sp, 0xFD);
+
+            assert_eq!(cpu.flag(FLAG_Z), z, "Z at step {index}");
+            assert_eq!(cpu.flag(FLAG_N), n, "N at step {index}");
+            assert_eq!(
+                cpu.status & !(FLAG_Z | FLAG_N),
+                preserved_flags,
+                "Other flags at step {index}"
+            );
+        }
+
+        assert_eq!(total_cycles, 10);
     }
 }
