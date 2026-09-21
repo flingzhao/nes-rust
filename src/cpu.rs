@@ -143,6 +143,12 @@ impl Cpu {
         self.update_zero_negative(self.a);
     }
 
+    fn bit_test(&mut self, value: u8) {
+        self.set_flag(FLAG_Z, (self.a & value) == 0);
+        self.set_flag(FLAG_N, (value & 0x80) != 0);
+        self.set_flag(FLAG_V, (value & 0x40) != 0);
+    }
+
     fn compare_register(&mut self, value: u8, register: u8) {
         let result = register.wrapping_sub(value);
         let c = register >= value;
@@ -315,6 +321,36 @@ impl Cpu {
                 self.y = self.y.wrapping_sub(1);
                 self.update_zero_negative(self.y);
                 Ok(2)
+            }
+            0x29 => {
+                let value = self.fetch_byte(bus)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                Ok(2)
+            }
+            0x09 => {
+                let value = self.fetch_byte(bus)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                Ok(2)
+            }
+            0x49 => {
+                let value = self.fetch_byte(bus)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                Ok(2)
+            }
+            0x24 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                self.bit_test(value);
+                Ok(3)
+            }
+            0x2C => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.bit_test(value);
+                Ok(4)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -1106,5 +1142,152 @@ mod tests {
         }
 
         assert_eq!(total_cycles, 10);
+    }
+
+    #[test]
+    fn immediate_logic_updates_a_and_only_z_n() {
+        let cases = [
+            // opcode, A, operand, result
+            (0x29u8, 0xF0u8, 0x0Fu8, 0x00u8), // AND
+            (0x29, 0xFF, 0x80, 0x80),
+            (0x09, 0x00, 0x00, 0x00), // ORA
+            (0x09, 0x40, 0x80, 0xC0),
+            (0x49, 0xAA, 0xAA, 0x00), // EOR
+            (0x49, 0x55, 0xFF, 0xAA),
+            (0x49, 0xFF, 0x80, 0x7F),
+        ];
+
+        for (opcode, a, operand, expected) in cases {
+            for initial_cv in [0u8, FLAG_C | FLAG_V] {
+                let mut cpu = Cpu::new();
+                let mut bus = bus_with_ram_program(&[opcode, operand]);
+
+                cpu.pc = 0;
+                cpu.a = a;
+                cpu.x = 0x12;
+                cpu.y = 0x34;
+                cpu.sp = 0xFD;
+                cpu.status = FLAG_U | FLAG_I | FLAG_D | initial_cv;
+
+                // 检查 Z、N 既能置位，也能清除。
+                cpu.set_flag(FLAG_Z, expected != 0);
+                cpu.set_flag(FLAG_N, expected & 0x80 == 0);
+                let preserved = cpu.status & !(FLAG_Z | FLAG_N);
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+                assert_eq!(cpu.pc, 2);
+                assert_eq!(cpu.a, expected);
+                assert_eq!((cpu.x, cpu.y, cpu.sp), (0x12, 0x34, 0xFD));
+
+                assert_eq!(cpu.flag(FLAG_Z), expected == 0);
+                assert_eq!(cpu.flag(FLAG_N), expected & 0x80 != 0);
+                assert_eq!(cpu.status & !(FLAG_Z | FLAG_N), preserved);
+            }
+        }
+    }
+
+    #[test]
+    fn bit_reads_n_v_from_memory_and_z_from_and_result() {
+        let cases = [
+            // A, memory, Z, N, V
+            (0x01u8, 0xC0u8, true, true, true),
+            (0x80, 0x80, false, true, false),
+            (0x40, 0x40, false, false, true),
+            (0xFF, 0x00, true, false, false),
+        ];
+
+        let modes: [(&[u8], u16, u16, u8); 2] = [
+            // 程序字节、数据地址、最终 PC、周期数
+            (&[0x24, 0x40], 0x0040, 2, 3),
+            (&[0x2C, 0x23, 0x01], 0x0123, 3, 4),
+        ];
+
+        for (program, addr, expected_pc, cycles) in modes {
+            for (a, memory, z, n, v) in cases {
+                for carry in [false, true] {
+                    let mut cpu = Cpu::new();
+                    let mut bus = bus_with_ram_program(program);
+                    bus.cpu_write(addr, memory).unwrap();
+
+                    cpu.pc = 0;
+                    cpu.a = a;
+                    cpu.x = 0x12;
+                    cpu.y = 0x34;
+                    cpu.sp = 0xFD;
+                    cpu.status = FLAG_U | FLAG_I | FLAG_D;
+
+                    cpu.set_flag(FLAG_C, carry);
+                    cpu.set_flag(FLAG_Z, !z);
+                    cpu.set_flag(FLAG_N, !n);
+                    cpu.set_flag(FLAG_V, !v);
+
+                    let changed = FLAG_Z | FLAG_N | FLAG_V;
+                    let preserved = cpu.status & !changed;
+
+                    assert_eq!(cpu.step(&mut bus).unwrap(), cycles);
+                    assert_eq!(cpu.pc, expected_pc);
+                    assert_eq!((cpu.a, cpu.x, cpu.y, cpu.sp), (a, 0x12, 0x34, 0xFD));
+                    assert_eq!(bus.cpu_read(addr).unwrap(), memory);
+
+                    assert_eq!(cpu.flag(FLAG_Z), z);
+                    assert_eq!(cpu.flag(FLAG_N), n);
+                    assert_eq!(cpu.flag(FLAG_V), v);
+                    assert_eq!(cpu.status & !changed, preserved);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logic_chain_updates_a_and_preserves_other_flags() {
+        for carry in [false, true] {
+            for overflow in [false, true] {
+                let mut cpu = Cpu::new();
+                let mut bus = bus_with_ram_program(&[
+                    0x29, 0x0F, // AND #$0F
+                    0x09, 0x80, // ORA #$80
+                    0x49, 0xFF, // EOR #$FF
+                ]);
+
+                cpu.pc = 0;
+                cpu.a = 0xA5;
+                cpu.x = 0x12;
+                cpu.y = 0x34;
+                cpu.sp = 0xFD;
+                cpu.status = FLAG_U | FLAG_I | FLAG_D | FLAG_Z | FLAG_N;
+                cpu.set_flag(FLAG_C, carry);
+                cpu.set_flag(FLAG_V, overflow);
+
+                let preserved_flags = cpu.status & !(FLAG_Z | FLAG_N);
+                let mut total_cycles = 0u32;
+
+                let expectations = [
+                    // PC, A, Z, N
+                    (2u16, 0x05u8, false, false),
+                    (4, 0x85, false, true),
+                    (6, 0x7A, false, false),
+                ];
+
+                for (index, (pc, a, z, n)) in expectations.into_iter().enumerate() {
+                    let cycles = cpu.step(&mut bus).unwrap();
+                    total_cycles += u32::from(cycles);
+
+                    assert_eq!(cycles, 2, "Cycles at step {index}");
+                    assert_eq!(cpu.pc, pc, "PC at step {index}");
+                    assert_eq!(cpu.a, a, "A at step {index}");
+                    assert_eq!(cpu.flag(FLAG_Z), z, "Z at step {index}");
+                    assert_eq!(cpu.flag(FLAG_N), n, "N at step {index}");
+
+                    assert_eq!(
+                        cpu.status & !(FLAG_Z | FLAG_N),
+                        preserved_flags,
+                        "Other flags at step {index}"
+                    );
+                    assert_eq!((cpu.x, cpu.y, cpu.sp), (0x12, 0x34, 0xFD));
+                }
+
+                assert_eq!(total_cycles, 6);
+            }
+        }
     }
 }
