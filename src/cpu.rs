@@ -143,6 +143,13 @@ impl Cpu {
         self.update_zero_negative(self.a);
     }
 
+    fn compare_register(&mut self, value: u8, register: u8) {
+        let result = register.wrapping_sub(value);
+        let c = register >= value;
+        self.set_flag(FLAG_C, c);
+        self.update_zero_negative(result);
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -241,6 +248,21 @@ impl Cpu {
             0xe9 => {
                 let value = self.fetch_byte(bus)?;
                 self.sbc(value);
+                Ok(2)
+            }
+            0xc9 => {
+                let value = self.fetch_byte(bus)?;
+                self.compare_register(value, self.a);
+                Ok(2)
+            }
+            0xe0 => {
+                let value = self.fetch_byte(bus)?;
+                self.compare_register(value, self.x);
+                Ok(2)
+            }
+            0xc0 => {
+                let value = self.fetch_byte(bus)?;
+                self.compare_register(value, self.y);
                 Ok(2)
             }
             0xEA => Ok(2),
@@ -792,6 +814,72 @@ mod tests {
                 let expected_preserved = FLAG_U | FLAG_I | if decimal { FLAG_D } else { 0 };
 
                 assert_eq!(cpu.status & preserved_mask, expected_preserved);
+            }
+        }
+    }
+
+    #[test]
+    fn immediate_comparisons_update_only_c_z_n() {
+        let cases = [
+            // register, operand, C, Z, N
+            (0x05u8, 0x03u8, true, false, false),
+            (0x03, 0x05, false, false, true),
+            (0x42, 0x42, true, true, false),
+            (0x00, 0xFF, false, false, false),
+            (0xFF, 0x00, true, false, true),
+            (0x80, 0x01, true, false, false),
+        ];
+
+        for opcode in [0xC9u8, 0xE0, 0xC0] {
+            for (register, operand, c, z, n) in cases {
+                // 验证比较不依赖旧 C，也不改变旧 V。
+                for initial_c in [false, true] {
+                    for initial_v in [false, true] {
+                        let mut cpu = Cpu::new();
+                        let mut bus = bus_with_ram_program(&[opcode, operand]);
+
+                        cpu.pc = 0;
+                        cpu.a = 0x11;
+                        cpu.x = 0x22;
+                        cpu.y = 0x33;
+                        cpu.sp = 0xFD;
+
+                        match opcode {
+                            0xC9 => cpu.a = register,
+                            0xE0 => cpu.x = register,
+                            0xC0 => cpu.y = register,
+                            _ => unreachable!(),
+                        }
+
+                        cpu.status = FLAG_U | FLAG_I | FLAG_D;
+                        cpu.set_flag(FLAG_C, initial_c);
+                        cpu.set_flag(FLAG_V, initial_v);
+
+                        // 刻意设成与预期相反，检查设置和清除。
+                        cpu.set_flag(FLAG_Z, !z);
+                        cpu.set_flag(FLAG_N, !n);
+
+                        let before_registers = (cpu.a, cpu.x, cpu.y, cpu.sp);
+                        let before_status = cpu.status;
+
+                        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+                        assert_eq!(cpu.pc, 2);
+                        assert_eq!((cpu.a, cpu.x, cpu.y, cpu.sp), before_registers);
+
+                        let changed_mask = FLAG_C | FLAG_Z | FLAG_N;
+                        let expected_status = (before_status & !changed_mask)
+                            | if c { FLAG_C } else { 0 }
+                            | if z { FLAG_Z } else { 0 }
+                            | if n { FLAG_N } else { 0 };
+
+                        assert_eq!(
+                            cpu.status, expected_status,
+                            "opcode={opcode:#04X}, \
+                         register={register:#04X}, \
+                         operand={operand:#04X}"
+                        );
+                    }
+                }
             }
         }
     }
