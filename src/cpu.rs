@@ -156,6 +156,36 @@ impl Cpu {
         self.update_zero_negative(result);
     }
 
+    fn asl(&mut self, value: u8) -> u8 {
+        self.set_flag(FLAG_C, value & 0x80 != 0);
+        let value = value << 1;
+        self.update_zero_negative(value);
+        value
+    }
+
+    fn lsr(&mut self, value: u8) -> u8 {
+        self.set_flag(FLAG_C, value & 0x01 != 0);
+        let value = value >> 1;
+        self.update_zero_negative(value);
+        value
+    }
+
+    fn rol(&mut self, value: u8) -> u8 {
+        let carry_in = u8::from(self.flag(FLAG_C));
+        self.set_flag(FLAG_C, value & 0x80 != 0);
+        let value = (value << 1) | carry_in;
+        self.update_zero_negative(value);
+        value
+    }
+
+    fn ror(&mut self, value: u8) -> u8 {
+        let carry_in = u8::from(self.flag(FLAG_C));
+        self.set_flag(FLAG_C, value & 0x01 != 0);
+        let value = value >> 1 | carry_in << 7;
+        self.update_zero_negative(value);
+        value
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -351,6 +381,22 @@ impl Cpu {
                 let value = bus.cpu_read(addr)?;
                 self.bit_test(value);
                 Ok(4)
+            }
+            0x0A => {
+                self.a = self.asl(self.a);
+                Ok(2)
+            }
+            0x4A => {
+                self.a = self.lsr(self.a);
+                Ok(2)
+            }
+            0x2A => {
+                self.a = self.rol(self.a);
+                Ok(2)
+            }
+            0x6A => {
+                self.a = self.ror(self.a);
+                Ok(2)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -1289,5 +1335,115 @@ mod tests {
                 assert_eq!(total_cycles, 6);
             }
         }
+    }
+
+    #[test]
+    fn accumulator_shifts_and_rotates_update_c_z_n() {
+        let cases = [
+            // opcode, A, old C, expected A, expected C
+
+            // ASL：忽略输入 Carry。
+            (0x0Au8, 0x80u8, false, 0x00u8, true),
+            (0x0A, 0x80, true, 0x00, true),
+            (0x0A, 0x40, true, 0x80, false),
+            (0x0A, 0x01, false, 0x02, false),
+            // LSR：忽略输入 Carry，结果最高位为零。
+            (0x4A, 0x01, false, 0x00, true),
+            (0x4A, 0x01, true, 0x00, true),
+            (0x4A, 0x80, true, 0x40, false),
+            (0x4A, 0xFF, false, 0x7F, true),
+            // ROL：必须使用旧 Carry。
+            (0x2A, 0x80, false, 0x00, true),
+            (0x2A, 0x80, true, 0x01, true),
+            (0x2A, 0x00, true, 0x01, false),
+            (0x2A, 0x40, false, 0x80, false),
+            // ROR：旧 Carry 进入 bit 7。
+            (0x6A, 0x01, false, 0x00, true),
+            (0x6A, 0x01, true, 0x80, true),
+            (0x6A, 0x00, true, 0x80, false),
+            (0x6A, 0x80, false, 0x40, false),
+        ];
+
+        for (opcode, a, carry_in, expected_a, expected_c) in cases {
+            for overflow in [false, true] {
+                let mut cpu = Cpu::new();
+                let mut bus = bus_with_ram_program(&[opcode]);
+
+                cpu.pc = 0;
+                cpu.a = a;
+                cpu.x = 0x12;
+                cpu.y = 0x34;
+                cpu.sp = 0xFD;
+                cpu.status = FLAG_U | FLAG_I | FLAG_D;
+
+                cpu.set_flag(FLAG_C, carry_in);
+                cpu.set_flag(FLAG_V, overflow);
+                cpu.set_flag(FLAG_Z, expected_a != 0);
+                cpu.set_flag(FLAG_N, expected_a & 0x80 == 0);
+
+                let changed = FLAG_C | FLAG_Z | FLAG_N;
+                let preserved = cpu.status & !changed;
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+                assert_eq!(cpu.pc, 1);
+                assert_eq!(
+                    cpu.a, expected_a,
+                    "opcode={opcode:#04X}, A={a:#04X}, C={carry_in}"
+                );
+                assert_eq!(cpu.flag(FLAG_C), expected_c);
+                assert_eq!(cpu.flag(FLAG_Z), expected_a == 0);
+                assert_eq!(cpu.flag(FLAG_N), expected_a & 0x80 != 0);
+                assert_eq!(cpu.status & !changed, preserved);
+                assert_eq!((cpu.x, cpu.y, cpu.sp), (0x12, 0x34, 0xFD));
+            }
+        }
+    }
+
+    #[test]
+    fn nine_rol_instructions_restore_accumulator_and_carry() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[0x2A; 9]);
+
+        cpu.pc = 0;
+        cpu.a = 0xA5;
+        cpu.x = 0x12;
+        cpu.y = 0x34;
+        cpu.sp = 0xFD;
+        cpu.status = FLAG_U | FLAG_I | FLAG_D | FLAG_V | FLAG_C;
+
+        let preserved = cpu.status & !(FLAG_C | FLAG_Z | FLAG_N);
+        let mut total_cycles = 0u32;
+
+        let expectations = [
+            // 每次执行后的 A、C
+            (0x4Bu8, true),
+            (0x97, false),
+            (0x2E, true),
+            (0x5D, false),
+            (0xBA, false),
+            (0x74, true),
+            (0xE9, false),
+            (0xD2, true),
+            (0xA5, true),
+        ];
+
+        for (index, (a, carry)) in expectations.into_iter().enumerate() {
+            let cycles = cpu.step(&mut bus).unwrap();
+            total_cycles += u32::from(cycles);
+
+            assert_eq!(cycles, 2);
+            assert_eq!(cpu.pc, (index + 1) as u16);
+            assert_eq!(cpu.a, a, "A at step {index}");
+            assert_eq!(cpu.flag(FLAG_C), carry, "C at step {index}");
+            assert_eq!(cpu.flag(FLAG_Z), a == 0);
+            assert_eq!(cpu.flag(FLAG_N), a & 0x80 != 0);
+            assert_eq!(cpu.status & !(FLAG_C | FLAG_Z | FLAG_N), preserved);
+            assert_eq!((cpu.x, cpu.y, cpu.sp), (0x12, 0x34, 0xFD));
+        }
+
+        assert_eq!(cpu.a, 0xA5);
+        assert!(cpu.flag(FLAG_C));
+        assert_eq!(cpu.pc, 9);
+        assert_eq!(total_cycles, 18);
     }
 }
