@@ -186,6 +186,18 @@ impl Cpu {
         value
     }
 
+    fn inc(&mut self, value: u8) -> u8 {
+        let value = value.wrapping_add(1);
+        self.update_zero_negative(value);
+        value
+    }
+
+    fn dec(&mut self, value: u8) -> u8 {
+        let value = value.wrapping_sub(1);
+        self.update_zero_negative(value);
+        value
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -397,6 +409,90 @@ impl Cpu {
             0x6A => {
                 self.a = self.ror(self.a);
                 Ok(2)
+            }
+            0x06 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                let value = self.asl(value);
+                bus.cpu_write(addr, value)?;
+                Ok(5)
+            }
+            0x46 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                let value = self.lsr(value);
+                bus.cpu_write(addr, value)?;
+                Ok(5)
+            }
+            0x26 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                let value = self.rol(value);
+                bus.cpu_write(addr, value)?;
+                Ok(5)
+            }
+            0x66 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                let value = self.ror(value);
+                bus.cpu_write(addr, value)?;
+                Ok(5)
+            }
+            0xE6 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                let value = self.inc(value);
+                bus.cpu_write(addr, value)?;
+                Ok(5)
+            }
+            0xC6 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                let value = self.dec(value);
+                bus.cpu_write(addr, value)?;
+                Ok(5)
+            }
+            0x0E => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                let value = self.asl(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0x4E => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                let value = self.lsr(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0x2E => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                let value = self.rol(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0x6E => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                let value = self.ror(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0xEE => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                let value = self.inc(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0xCE => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                let value = self.dec(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -1445,5 +1541,68 @@ mod tests {
         assert!(cpu.flag(FLAG_C));
         assert_eq!(cpu.pc, 9);
         assert_eq!(total_cycles, 18);
+    }
+
+    #[test]
+    fn memory_rmw_updates_data_without_changing_registers() {
+        let cases = [
+            // 零页码、绝对码、原值、输入 C、结果、输出 C
+            (0x06u8, 0x0Eu8, 0x80u8, false, 0x00u8, true), // ASL
+            (0x06, 0x0E, 0x40, true, 0x80, false),
+            (0x46, 0x4E, 0x01, false, 0x00, true), // LSR
+            (0x46, 0x4E, 0x80, true, 0x40, false),
+            (0x26, 0x2E, 0x80, true, 0x01, true), // ROL
+            (0x26, 0x2E, 0x00, true, 0x01, false),
+            (0x66, 0x6E, 0x01, true, 0x80, true), // ROR
+            (0x66, 0x6E, 0x00, true, 0x80, false),
+            (0xE6, 0xEE, 0xFF, false, 0x00, false), // INC
+            (0xE6, 0xEE, 0x7F, true, 0x80, true),
+            (0xC6, 0xCE, 0x00, false, 0xFF, false), // DEC
+            (0xC6, 0xCE, 0x01, true, 0x00, true),
+        ];
+
+        for (zp, abs, old, carry_in, expected, carry_out) in cases {
+            for absolute in [false, true] {
+                for overflow in [false, true] {
+                    let (program, addr, pc, cycles) = if absolute {
+                        (vec![abs, 0x23, 0x01], 0x0123u16, 3u16, 6u8)
+                    } else {
+                        (vec![zp, 0x40], 0x0040u16, 2u16, 5u8)
+                    };
+
+                    let mut cpu = Cpu::new();
+                    let mut bus = bus_with_ram_program(&program);
+
+                    bus.cpu_write(addr, old).unwrap();
+                    bus.cpu_write(addr - 1, 0x5A).unwrap();
+                    bus.cpu_write(addr + 1, 0xA5).unwrap();
+
+                    cpu.pc = 0;
+                    cpu.a = 0x11;
+                    cpu.x = 0x22;
+                    cpu.y = 0x33;
+                    cpu.sp = 0xFD;
+                    cpu.status = FLAG_U | FLAG_I | FLAG_D;
+                    cpu.set_flag(FLAG_C, carry_in);
+                    cpu.set_flag(FLAG_V, overflow);
+                    cpu.set_flag(FLAG_Z, expected != 0);
+                    cpu.set_flag(FLAG_N, expected & 0x80 == 0);
+
+                    let preserved = cpu.status & !(FLAG_C | FLAG_Z | FLAG_N);
+
+                    assert_eq!(cpu.step(&mut bus).unwrap(), cycles);
+                    assert_eq!(cpu.pc, pc);
+                    assert_eq!(bus.cpu_read(addr).unwrap(), expected);
+                    assert_eq!(bus.cpu_read(addr - 1).unwrap(), 0x5A);
+                    assert_eq!(bus.cpu_read(addr + 1).unwrap(), 0xA5);
+
+                    assert_eq!((cpu.a, cpu.x, cpu.y, cpu.sp), (0x11, 0x22, 0x33, 0xFD));
+                    assert_eq!(cpu.flag(FLAG_C), carry_out);
+                    assert_eq!(cpu.flag(FLAG_Z), expected == 0);
+                    assert_eq!(cpu.flag(FLAG_N), expected & 0x80 != 0);
+                    assert_eq!(cpu.status & !(FLAG_C | FLAG_Z | FLAG_N), preserved);
+                }
+            }
+        }
     }
 }
