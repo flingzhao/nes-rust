@@ -1605,4 +1605,35 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn inc_then_ror_uses_carry_preserved_by_inc() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0xE6, 0x40, // INC $40
+            0x66, 0x40, // ROR $40
+        ]);
+
+        bus.cpu_write(0x0040, 0xFF).unwrap();
+
+        cpu.pc = 0;
+        cpu.a = 0x42;
+        cpu.status = FLAG_U | FLAG_I | FLAG_V | FLAG_C;
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 5);
+        assert_eq!(cpu.pc, 2);
+        assert_eq!(bus.cpu_read(0x0040).unwrap(), 0x00);
+        assert!(cpu.flag(FLAG_C), "INC 不应修改 Carry");
+        assert!(cpu.flag(FLAG_Z));
+        assert!(!cpu.flag(FLAG_N));
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 5);
+        assert_eq!(cpu.pc, 4);
+        assert_eq!(bus.cpu_read(0x0040).unwrap(), 0x80);
+        assert!(!cpu.flag(FLAG_C));
+        assert!(!cpu.flag(FLAG_Z));
+        assert!(cpu.flag(FLAG_N));
+
+        assert_eq!(cpu.a, 0x42);
+        assert!(cpu.flag(FLAG_V));
+    }
 }
