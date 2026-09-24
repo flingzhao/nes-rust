@@ -494,6 +494,51 @@ impl Cpu {
                 bus.cpu_write(addr, value)?;
                 Ok(6)
             }
+            0xB5 => {
+                // LDA zero page,X
+                let base = self.fetch_byte(bus)?;
+                let addr = u16::from(base.wrapping_add(self.x));
+                self.a = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x95 => {
+                // STA zero page,X
+                let base = self.fetch_byte(bus)?;
+                let addr = u16::from(base.wrapping_add(self.x));
+                bus.cpu_write(addr, self.a)?;
+                Ok(4)
+            }
+            0xB6 => {
+                // LDX zero page,Y
+                let base = self.fetch_byte(bus)?;
+                let addr = u16::from(base.wrapping_add(self.y));
+                self.x = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.x);
+                Ok(4)
+            }
+            0x96 => {
+                // STX zero page,Y
+                let base = self.fetch_byte(bus)?;
+                let addr = u16::from(base.wrapping_add(self.y));
+                bus.cpu_write(addr, self.x)?;
+                Ok(4)
+            }
+            0xB4 => {
+                // LDY zero page,X
+                let base = self.fetch_byte(bus)?;
+                let addr = u16::from(base.wrapping_add(self.x));
+                self.y = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.y);
+                Ok(4)
+            }
+            0x94 => {
+                // STY zero page,X
+                let base = self.fetch_byte(bus)?;
+                let addr = u16::from(base.wrapping_add(self.x));
+                bus.cpu_write(addr, self.y)?;
+                Ok(4)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -1635,5 +1680,92 @@ mod tests {
 
         assert_eq!(cpu.a, 0x42);
         assert!(cpu.flag(FLAG_V));
+    }
+
+    #[test]
+    fn indexed_zero_page_loads_wrap_and_use_the_right_index() {
+        let cases = [
+            // opcode, operand, A, X, Y, expected A, X, Y
+            (
+                0xB5u8, 0xFEu8, 0x11u8, 0x42u8, 0x43u8, 0x80u8, 0x42u8, 0x43u8,
+            ), // LDA $FE,X
+            (0xB6, 0xFD, 0x11, 0x42, 0x43, 0x11, 0x80, 0x43), // LDX $FD,Y
+            (0xB4, 0xFE, 0x11, 0x42, 0x43, 0x11, 0x42, 0x80), // LDY $FE,X
+        ];
+
+        for (opcode, operand, a, x, y, expected_a, expected_x, expected_y) in cases {
+            let mut cpu = Cpu::new();
+            let mut bus = bus_with_ram_program(&[opcode, operand]);
+
+            bus.cpu_write(0x0040, 0x80).unwrap();
+            bus.cpu_write(0x0140, 0x77).unwrap();
+
+            cpu.pc = 0;
+            cpu.a = a;
+            cpu.x = x;
+            cpu.y = y;
+            cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 4);
+            assert_eq!(cpu.pc, 2);
+            assert_eq!((cpu.a, cpu.x, cpu.y), (expected_a, expected_x, expected_y));
+            assert_eq!(bus.cpu_read(0x0040).unwrap(), 0x80);
+            assert_eq!(bus.cpu_read(0x0140).unwrap(), 0x77);
+            assert!(cpu.flag(FLAG_N));
+            assert!(!cpu.flag(FLAG_Z));
+            assert!(cpu.flag(FLAG_C));
+            assert!(cpu.flag(FLAG_V));
+        }
+    }
+
+    #[test]
+    fn indexed_zero_page_stores_wrap_without_changing_flags() {
+        let cases = [
+            // opcode, operand, expected memory value
+            (0x95u8, 0xFEu8, 0x55u8), // STA $FE,X
+            (0x96, 0xFD, 0x42),       // STX $FD,Y
+            (0x94, 0xFE, 0x43),       // STY $FE,X
+        ];
+
+        for (opcode, operand, expected) in cases {
+            let mut cpu = Cpu::new();
+            let mut bus = bus_with_ram_program(&[opcode, operand]);
+
+            bus.cpu_write(0x0040, 0x80).unwrap();
+            bus.cpu_write(0x0140, 0x77).unwrap();
+
+            cpu.pc = 0;
+            cpu.a = 0x55;
+            cpu.x = 0x42;
+            cpu.y = 0x43;
+            cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V | FLAG_Z;
+            let before_status = cpu.status;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 4);
+            assert_eq!(cpu.pc, 2);
+            assert_eq!(bus.cpu_read(0x0040).unwrap(), expected);
+            assert_eq!(bus.cpu_read(0x0140).unwrap(), 0x77);
+            assert_eq!((cpu.a, cpu.x, cpu.y), (0x55, 0x42, 0x43));
+            assert_eq!(cpu.status, before_status);
+        }
+    }
+
+    #[test]
+    fn indexed_zero_page_load_without_wrap() {
+        let mut cpu = Cpu::new();
+        let mut bus = bus_with_ram_program(&[
+            0xB5, 0x20, // LDA $20,X
+        ]);
+
+        bus.cpu_write(0x0023, 0x7F).unwrap();
+
+        cpu.pc = 0;
+        cpu.x = 0x03;
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 4);
+        assert_eq!(cpu.a, 0x7F);
+        assert_eq!(cpu.pc, 2);
+        assert!(!cpu.flag(FLAG_Z));
+        assert!(!cpu.flag(FLAG_N));
     }
 }
