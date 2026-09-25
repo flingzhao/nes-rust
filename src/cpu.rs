@@ -198,6 +198,13 @@ impl Cpu {
         value
     }
 
+    fn fetch_absolute_indexed(&mut self, bus: &mut Bus, index: u8) -> Result<(u16, bool), String> {
+        let base = self.fetch_word(bus)?;
+        let addr = base.wrapping_add(u16::from(index));
+        let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+        Ok((addr, crossed_page))
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -538,6 +545,28 @@ impl Cpu {
                 let addr = u16::from(base.wrapping_add(self.x));
                 bus.cpu_write(addr, self.y)?;
                 Ok(4)
+            }
+            0xBD => {
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x)?;
+                self.a = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.a);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0xB9 => {
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y)?;
+                self.a = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.a);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x9D => {
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x)?;
+                bus.cpu_write(addr, self.a)?;
+                Ok(5)
+            }
+            0x99 => {
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.y)?;
+                bus.cpu_write(addr, self.a)?;
+                Ok(5)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -1767,5 +1796,87 @@ mod tests {
         assert_eq!(cpu.pc, 2);
         assert!(!cpu.flag(FLAG_Z));
         assert!(!cpu.flag(FLAG_N));
+    }
+
+    #[test]
+    fn absolute_indexed_lda_reads_target_and_counts_page_crossing() {
+        let cases = [
+            // opcode, base, index, target, cycles
+            (0xBDu8, 0x0120u16, 3u8, 0x0123u16, 4u8), // ,X 不跨页
+            (0xB9, 0x0120, 3, 0x0123, 4),             // ,Y 不跨页
+            (0xBD, 0x01FF, 1, 0x0200, 5),             // ,X 跨页
+            (0xB9, 0x01FF, 1, 0x0200, 5),             // ,Y 跨页
+        ];
+
+        for (opcode, base, index, target, cycles) in cases {
+            let [low, high] = base.to_le_bytes();
+            let mut bus = bus_with_ram_program(&[opcode, low, high]);
+            bus.cpu_write(target, 0x80).unwrap();
+
+            let mut cpu = Cpu::new();
+            cpu.pc = 0;
+            cpu.a = 0x11;
+            cpu.x = if opcode == 0xBD { index } else { 0x10 };
+            cpu.y = if opcode == 0xB9 { index } else { 0x10 };
+            cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), cycles);
+            assert_eq!(cpu.pc, 3);
+            assert_eq!(cpu.a, 0x80);
+            assert!(cpu.flag(FLAG_N));
+            assert!(!cpu.flag(FLAG_Z));
+            assert!(cpu.flag(FLAG_C));
+            assert!(cpu.flag(FLAG_V));
+            assert_eq!(bus.cpu_read(target).unwrap(), 0x80);
+        }
+    }
+
+    #[test]
+    fn absolute_indexed_sta_always_takes_five_cycles() {
+        let cases = [
+            // opcode, base, index, target
+            (0x9Du8, 0x0120u16, 3u8, 0x0123u16),
+            (0x99, 0x0120, 3, 0x0123),
+            (0x9D, 0x01FF, 1, 0x0200),
+            (0x99, 0x01FF, 1, 0x0200),
+        ];
+
+        for (opcode, base, index, target) in cases {
+            let [low, high] = base.to_le_bytes();
+            let mut bus = bus_with_ram_program(&[opcode, low, high]);
+
+            let mut cpu = Cpu::new();
+            cpu.pc = 0;
+            cpu.a = 0x5A;
+            cpu.x = if opcode == 0x9D { index } else { 0x10 };
+            cpu.y = if opcode == 0x99 { index } else { 0x10 };
+            cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V | FLAG_Z;
+            let original_status = cpu.status;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 5);
+            assert_eq!(cpu.pc, 3);
+            assert_eq!(cpu.a, 0x5A);
+            assert_eq!(cpu.status, original_status);
+            assert_eq!(bus.cpu_read(target).unwrap(), 0x5A);
+        }
+    }
+
+    #[test]
+    fn absolute_indexed_address_wraps_at_ffff() {
+        let mut bus = Bus::new();
+
+        // 程序放在 0200，避免与目标地址 0000 重叠。
+        for (i, byte) in [0xBDu8, 0xFF, 0xFF].into_iter().enumerate() {
+            bus.cpu_write(0x0200 + i as u16, byte).unwrap();
+        }
+        bus.cpu_write(0x0000, 0x42).unwrap();
+
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x0200;
+        cpu.x = 1;
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 5);
+        assert_eq!(cpu.a, 0x42);
+        assert_eq!(cpu.pc, 0x0203);
     }
 }
