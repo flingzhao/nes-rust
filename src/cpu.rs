@@ -608,6 +608,50 @@ impl Cpu {
                 bus.cpu_write(addr, self.a)?;
                 Ok(6)
             }
+            0xA6 => {
+                let addr = self.fetch_byte(bus)? as u16;
+                self.x = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.x);
+                Ok(3)
+            }
+            0xA4 => {
+                let addr = self.fetch_byte(bus)? as u16;
+                self.y = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.y);
+                Ok(3)
+            }
+            0x86 => {
+                let addr = self.fetch_byte(bus)? as u16;
+                bus.cpu_write(addr, self.x)?;
+                Ok(3)
+            }
+            0x84 => {
+                let addr = self.fetch_byte(bus)? as u16;
+                bus.cpu_write(addr, self.y)?;
+                Ok(3)
+            }
+            0xAE => {
+                let addr = self.fetch_word(bus)?;
+                self.x = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.x);
+                Ok(4)
+            }
+            0xAC => {
+                let addr = self.fetch_word(bus)?;
+                self.y = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.y);
+                Ok(4)
+            }
+            0x8E => {
+                let addr = self.fetch_word(bus)?;
+                bus.cpu_write(addr, self.x)?;
+                Ok(4)
+            }
+            0x8C => {
+                let addr = self.fetch_word(bus)?;
+                bus.cpu_write(addr, self.y)?;
+                Ok(4)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -2028,5 +2072,73 @@ mod tests {
         assert_eq!(cpu.step(&mut bus).unwrap(), 6);
         assert_eq!(cpu.a, 0x42);
         assert_eq!(cpu.pc, 0x0302);
+    }
+
+    #[test]
+    fn index_register_memory_loads_and_stores() {
+        let cases = [
+            // opcode, absolute, load, use_x
+            (0xA6u8, false, true, true), // LDX zero page
+            (0xAE, true, true, true),    // LDX absolute
+            (0xA4, false, true, false),  // LDY zero page
+            (0xAC, true, true, false),   // LDY absolute
+            (0x86, false, false, true),  // STX zero page
+            (0x8E, true, false, true),   // STX absolute
+            (0x84, false, false, false), // STY zero page
+            (0x8C, true, false, false),  // STY absolute
+        ];
+
+        for (opcode, absolute, load, use_x) in cases {
+            for memory_value in [0x00u8, 0x80] {
+                let program = if absolute {
+                    vec![opcode, 0x40, 0x01]
+                } else {
+                    vec![opcode, 0x40]
+                };
+
+                let addr = if absolute { 0x0140 } else { 0x0040 };
+                let mut bus = bus_with_ram_program(&program);
+                bus.cpu_write(addr, memory_value).unwrap();
+
+                let mut cpu = Cpu::new();
+                cpu.pc = 0;
+                cpu.a = 0x33;
+                cpu.x = 0x11;
+                cpu.y = 0x22;
+                cpu.sp = 0xFD;
+                cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V;
+
+                // 加载测试中让旧 Z、N 与预期相反。
+                cpu.set_flag(FLAG_Z, memory_value != 0);
+                cpu.set_flag(FLAG_N, memory_value & 0x80 == 0);
+                let original_status = cpu.status;
+
+                let expected_cycles = if absolute { 4 } else { 3 };
+                assert_eq!(cpu.step(&mut bus).unwrap(), expected_cycles);
+                assert_eq!(cpu.pc, if absolute { 3 } else { 2 });
+                assert_eq!((cpu.a, cpu.sp), (0x33, 0xFD));
+
+                if load {
+                    let expected = if use_x {
+                        (memory_value, 0x22)
+                    } else {
+                        (0x11, memory_value)
+                    };
+
+                    assert_eq!((cpu.x, cpu.y), expected);
+                    assert_eq!(bus.cpu_read(addr).unwrap(), memory_value);
+                    assert_eq!(cpu.flag(FLAG_Z), memory_value == 0);
+                    assert_eq!(cpu.flag(FLAG_N), memory_value & 0x80 != 0);
+                    assert_eq!(
+                        cpu.status & !(FLAG_Z | FLAG_N),
+                        original_status & !(FLAG_Z | FLAG_N)
+                    );
+                } else {
+                    assert_eq!((cpu.x, cpu.y), (0x11, 0x22));
+                    assert_eq!(bus.cpu_read(addr).unwrap(), if use_x { 0x11 } else { 0x22 });
+                    assert_eq!(cpu.status, original_status);
+                }
+            }
+        }
     }
 }
