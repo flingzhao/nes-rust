@@ -726,6 +726,42 @@ impl Cpu {
                 let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
+            0x65 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                self.adc(value);
+                Ok(3)
+            }
+            0xE5 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                self.sbc(value);
+                Ok(3)
+            }
+            0x75 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                self.adc(value);
+                Ok(4)
+            }
+            0xF5 => {
+                let addr = u16::from(self.fetch_byte(bus)?.wrapping_add(self.x));
+                let value = bus.cpu_read(addr)?;
+                self.sbc(value);
+                Ok(4)
+            }
+            0x6D => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.adc(value);
+                Ok(4)
+            }
+            0xED => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.sbc(value);
+                Ok(4)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -2420,6 +2456,137 @@ mod tests {
             &[(0x00FF, 0x40), (0x0000, 0x01)],
             5,
             (true, true, false),
+        );
+    }
+    #[test]
+    fn adc_sbc_memory_modes() {
+        fn check(
+            opcode: u8,
+            operands: &[u8],
+            data_addr: u16,
+            x: u8,
+            initial_a: u8,
+            value: u8,
+            carry_in: bool,
+            expected: (u8, bool, bool, bool, bool, u8),
+        ) {
+            let mut bus = Bus::new();
+            let mut cpu = Cpu::new();
+            cpu.pc = 0x0300;
+            cpu.a = initial_a;
+            cpu.x = x;
+            cpu.set_flag(FLAG_C, carry_in);
+
+            bus.cpu_write(0x0300, opcode).unwrap();
+            for (i, byte) in operands.iter().copied().enumerate() {
+                bus.cpu_write(0x0301 + i as u16, byte).unwrap();
+            }
+            bus.cpu_write(data_addr, value).unwrap();
+
+            let (a, c, z, v, n, cycles) = expected;
+            assert_eq!(cpu.step(&mut bus).unwrap(), cycles, "opcode {opcode:#04X}");
+            assert_eq!(cpu.pc, 0x0301 + operands.len() as u16);
+            assert_eq!(cpu.a, a, "opcode {opcode:#04X}");
+            assert_eq!(bus.cpu_read(data_addr).unwrap(), value);
+            assert_eq!(cpu.flag(FLAG_C), c);
+            assert_eq!(cpu.flag(FLAG_Z), z);
+            assert_eq!(cpu.flag(FLAG_V), v);
+            assert_eq!(cpu.flag(FLAG_N), n);
+        }
+
+        // ADC $40：正数 + 正数产生有符号溢出。
+        check(
+            0x65,
+            &[0x40],
+            0x0040,
+            0,
+            0x7F,
+            0x01,
+            false,
+            (0x80, false, false, true, true, 3),
+        );
+
+        // ADC $F0,X：X=$20，零页地址回绕到 $10。
+        check(
+            0x75,
+            &[0xF0],
+            0x0010,
+            0x20,
+            0xFF,
+            0x00,
+            true,
+            (0x00, true, true, false, false, 4),
+        );
+
+        // ADC $0140，验证输入进位参与计算。
+        check(
+            0x6D,
+            &[0x40, 0x01],
+            0x0140,
+            0,
+            0x10,
+            0x20,
+            true,
+            (0x31, false, false, false, false, 4),
+        );
+
+        // SBC $40：C=1 表示没有额外借位。
+        check(
+            0xE5,
+            &[0x40],
+            0x0040,
+            0,
+            0x00,
+            0x01,
+            true,
+            (0xFF, false, false, false, true, 3),
+        );
+
+        // SBC $F0,X：有符号溢出，同时不发生无符号借位。
+        check(
+            0xF5,
+            &[0xF0],
+            0x0010,
+            0x20,
+            0x80,
+            0x01,
+            true,
+            (0x7F, true, false, true, false, 4),
+        );
+
+        // SBC $0140：结果为零。
+        check(
+            0xED,
+            &[0x40, 0x01],
+            0x0140,
+            0,
+            0x10,
+            0x10,
+            true,
+            (0x00, true, true, false, false, 4),
+        );
+
+        // C=0 时 SBC 还要额外减 1。
+        check(
+            0xED,
+            &[0x40, 0x01],
+            0x0140,
+            0,
+            0x10,
+            0x10,
+            false,
+            (0xFF, false, false, false, true, 4),
+        );
+
+        check(
+            0xE5,
+            &[0x40],
+            0x0040,
+            0x20,
+            0x00,
+            0x01,
+            true,
+            (0xFF, false, false, false, true, 3),
         );
     }
 }
