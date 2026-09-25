@@ -205,6 +205,13 @@ impl Cpu {
         Ok((addr, crossed_page))
     }
 
+    fn read_zero_page_word(&mut self, bus: &mut Bus, pointer: u8) -> Result<u16, String> {
+        let low = bus.cpu_read(pointer as u16)?;
+        let high = bus.cpu_read(pointer.wrapping_add(1) as u16)?;
+        let addr = u16::from_le_bytes([low, high]);
+        Ok(addr)
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -567,6 +574,39 @@ impl Cpu {
                 let (addr, _) = self.fetch_absolute_indexed(bus, self.y)?;
                 bus.cpu_write(addr, self.a)?;
                 Ok(5)
+            }
+            0xA1 => {
+                // LDA ($nn, X)
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                self.a = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.a);
+                Ok(6)
+            }
+            0x81 => {
+                // STA ($nn, X)
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                bus.cpu_write(addr, self.a)?;
+                Ok(6)
+            }
+            0xB1 => {
+                // LDA ($nn), Y
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                self.a = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 6 } else { 5 })
+            }
+            0x91 => {
+                // STA ($nn), Y
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                bus.cpu_write(addr, self.a)?;
+                Ok(6)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -1878,5 +1918,115 @@ mod tests {
         assert_eq!(cpu.step(&mut bus).unwrap(), 5);
         assert_eq!(cpu.a, 0x42);
         assert_eq!(cpu.pc, 0x0203);
+    }
+
+    #[test]
+    fn indexed_indirect_x_wraps_pointer_within_zero_page() {
+        for opcode in [0xA1u8, 0x81] {
+            let mut bus = Bus::new();
+
+            bus.cpu_write(0x0300, opcode).unwrap();
+            bus.cpu_write(0x0301, 0xFE).unwrap();
+
+            // FE + X(1) = FF；指针高字节位于 00，而非 0100。
+            bus.cpu_write(0x00FF, 0x00).unwrap();
+            bus.cpu_write(0x0000, 0x04).unwrap();
+            bus.cpu_write(0x0400, 0x80).unwrap();
+
+            let mut cpu = Cpu::new();
+            cpu.pc = 0x0300;
+            cpu.x = 1;
+            cpu.y = 0x20;
+            cpu.a = if opcode == 0x81 { 0x55 } else { 0x11 };
+            cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V;
+            let before_status = cpu.status;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+            assert_eq!(cpu.pc, 0x0302);
+            assert_eq!((cpu.x, cpu.y), (1, 0x20));
+
+            if opcode == 0xA1 {
+                assert_eq!(cpu.a, 0x80);
+                assert_eq!(bus.cpu_read(0x0400).unwrap(), 0x80);
+                assert!(cpu.flag(FLAG_N));
+                assert!(!cpu.flag(FLAG_Z));
+                assert!(cpu.flag(FLAG_C));
+                assert!(cpu.flag(FLAG_V));
+            } else {
+                assert_eq!(cpu.a, 0x55);
+                assert_eq!(bus.cpu_read(0x0400).unwrap(), 0x55);
+                assert_eq!(cpu.status, before_status);
+            }
+        }
+    }
+
+    #[test]
+    fn indirect_indexed_y_counts_crossing_only_for_loads() {
+        let cases = [
+            // 指针指向的基础地址、Y、最终地址、LDA 周期
+            (0x03FEu16, 1u8, 0x03FFu16, 5u8),
+            (0x03FF, 1, 0x0400, 6),
+        ];
+
+        for (base, y, target, load_cycles) in cases {
+            for opcode in [0xB1u8, 0x91] {
+                let mut bus = Bus::new();
+
+                bus.cpu_write(0x0300, opcode).unwrap();
+                bus.cpu_write(0x0301, 0xFF).unwrap();
+
+                // 指针从零页 FF 跨回 00。
+                let [low, high] = base.to_le_bytes();
+                bus.cpu_write(0x00FF, low).unwrap();
+                bus.cpu_write(0x0000, high).unwrap();
+                bus.cpu_write(target, 0x80).unwrap();
+
+                let mut cpu = Cpu::new();
+                cpu.pc = 0x0300;
+                cpu.x = 0x20;
+                cpu.y = y;
+                cpu.a = if opcode == 0x91 { 0x55 } else { 0x11 };
+                cpu.status = FLAG_U | FLAG_I | FLAG_C | FLAG_V;
+                let before_status = cpu.status;
+
+                let expected_cycles = if opcode == 0xB1 { load_cycles } else { 6 };
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), expected_cycles);
+                assert_eq!(cpu.pc, 0x0302);
+                assert_eq!((cpu.x, cpu.y), (0x20, y));
+
+                if opcode == 0xB1 {
+                    assert_eq!(cpu.a, 0x80);
+                    assert_eq!(bus.cpu_read(target).unwrap(), 0x80);
+                    assert!(cpu.flag(FLAG_N));
+                    assert!(!cpu.flag(FLAG_Z));
+                    assert!(cpu.flag(FLAG_C));
+                    assert!(cpu.flag(FLAG_V));
+                } else {
+                    assert_eq!(cpu.a, 0x55);
+                    assert_eq!(bus.cpu_read(target).unwrap(), 0x55);
+                    assert_eq!(cpu.status, before_status);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indirect_indexed_y_wraps_final_sixteen_bit_address() {
+        let mut bus = Bus::new();
+
+        bus.cpu_write(0x0300, 0xB1).unwrap(); // LDA ($40),Y
+        bus.cpu_write(0x0301, 0x40).unwrap();
+        bus.cpu_write(0x0040, 0xFF).unwrap();
+        bus.cpu_write(0x0041, 0xFF).unwrap();
+        bus.cpu_write(0x0000, 0x42).unwrap();
+
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x0300;
+        cpu.y = 1;
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.a, 0x42);
+        assert_eq!(cpu.pc, 0x0302);
     }
 }
