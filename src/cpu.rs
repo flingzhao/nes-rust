@@ -652,6 +652,42 @@ impl Cpu {
                 bus.cpu_write(addr, self.y)?;
                 Ok(4)
             }
+            0xC5 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.a);
+                Ok(3)
+            }
+            0xE4 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.x);
+                Ok(3)
+            }
+            0xC4 => {
+                let addr = u16::from(self.fetch_byte(bus)?);
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.y);
+                Ok(3)
+            }
+            0xCD => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.a);
+                Ok(4)
+            }
+            0xEC => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.x);
+                Ok(4)
+            }
+            0xCC => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.y);
+                Ok(4)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -2138,6 +2174,67 @@ mod tests {
                     assert_eq!(bus.cpu_read(addr).unwrap(), if use_x { 0x11 } else { 0x22 });
                     assert_eq!(cpu.status, original_status);
                 }
+            }
+        }
+    }
+    #[test]
+    fn memory_compare_instructions_update_only_czn() {
+        // opcode, 是否绝对寻址, 比较的寄存器, 周期
+        let instructions = [
+            (0xC5, false, 'A', 3),
+            (0xCD, true, 'A', 4),
+            (0xE4, false, 'X', 3),
+            (0xEC, true, 'X', 4),
+            (0xC4, false, 'Y', 3),
+            (0xCC, true, 'Y', 4),
+        ];
+
+        // 寄存器值, 内存值, 预期 C, Z, N
+        let cases = [
+            (0x05, 0x03, true, false, false),
+            (0x05, 0x05, true, true, false),
+            (0x03, 0x05, false, false, true),
+            (0x00, 0xFF, false, false, false), // 00 - FF = 01（按 u8 回绕）
+            (0x80, 0x01, true, false, false),
+        ];
+
+        for (opcode, absolute, register, cycles) in instructions {
+            for (reg_value, memory_value, c, z, n) in cases {
+                let mut bus = Bus::new();
+                let mut cpu = Cpu::new();
+                cpu.pc = 0;
+
+                cpu.a = 0x11;
+                cpu.x = 0x22;
+                cpu.y = 0x33;
+                match register {
+                    'A' => cpu.a = reg_value,
+                    'X' => cpu.x = reg_value,
+                    'Y' => cpu.y = reg_value,
+                    _ => unreachable!(),
+                }
+                let registers_before = (cpu.a, cpu.x, cpu.y);
+
+                // 预置 V，验证比较指令不会清掉它。
+                cpu.status = FLAG_V;
+
+                let data_addr = if absolute { 0x0140 } else { 0x0040 };
+                bus.cpu_write(0x0000, opcode).unwrap();
+                bus.cpu_write(0x0001, 0x40).unwrap();
+                if absolute {
+                    bus.cpu_write(0x0002, 0x01).unwrap();
+                }
+                bus.cpu_write(data_addr, memory_value).unwrap();
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), cycles, "opcode {opcode:#04X}");
+                assert_eq!(cpu.pc, if absolute { 3 } else { 2 });
+                assert_eq!((cpu.a, cpu.x, cpu.y), registers_before);
+                assert_eq!(bus.cpu_read(data_addr).unwrap(), memory_value);
+
+                assert_eq!(cpu.flag(FLAG_C), c, "opcode {opcode:#04X}");
+                assert_eq!(cpu.flag(FLAG_Z), z, "opcode {opcode:#04X}");
+                assert_eq!(cpu.flag(FLAG_N), n, "opcode {opcode:#04X}");
+                assert!(cpu.flag(FLAG_V), "opcode {opcode:#04X} changed V");
             }
         }
     }
