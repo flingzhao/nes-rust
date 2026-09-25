@@ -688,6 +688,44 @@ impl Cpu {
                 self.compare_register(value, self.y);
                 Ok(4)
             }
+            0xD5 => {
+                let addr = u16::from(self.fetch_byte(bus)?.wrapping_add(self.x));
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.a);
+                Ok(4)
+            }
+            0xDD => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0xD9 => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0xC1 => {
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.a);
+                Ok(6)
+            }
+            0xD1 => {
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.compare_register(value, self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 6 } else { 5 })
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -2237,5 +2275,151 @@ mod tests {
                 assert!(cpu.flag(FLAG_V), "opcode {opcode:#04X} changed V");
             }
         }
+    }
+    #[test]
+    fn cmp_indexed_addressing_and_cycles() {
+        fn check(
+            opcode: u8,
+            operands: &[u8],
+            x: u8,
+            y: u8,
+            target: u16,
+            value: u8,
+            pointer_bytes: &[(u16, u8)],
+            expected_cycles: u8,
+            expected_czn: (bool, bool, bool),
+        ) {
+            let mut bus = Bus::new();
+            let mut cpu = Cpu::new();
+
+            // 程序不放在零页，避免与间接寻址使用的指针冲突。
+            cpu.pc = 0x0300;
+            cpu.a = 0x42;
+            cpu.x = x;
+            cpu.y = y;
+            cpu.status = FLAG_V;
+
+            bus.cpu_write(0x0300, opcode).unwrap();
+            for (index, byte) in operands.iter().copied().enumerate() {
+                bus.cpu_write(0x0301 + index as u16, byte).unwrap();
+            }
+            for &(addr, byte) in pointer_bytes {
+                bus.cpu_write(addr, byte).unwrap();
+            }
+            bus.cpu_write(target, value).unwrap();
+
+            assert_eq!(
+                cpu.step(&mut bus).unwrap(),
+                expected_cycles,
+                "opcode {opcode:#04X}"
+            );
+            assert_eq!(cpu.pc, 0x0301 + operands.len() as u16);
+            assert_eq!((cpu.a, cpu.x, cpu.y), (0x42, x, y));
+            assert_eq!(bus.cpu_read(target).unwrap(), value);
+
+            let (c, z, n) = expected_czn;
+            assert_eq!(cpu.flag(FLAG_C), c, "opcode {opcode:#04X}");
+            assert_eq!(cpu.flag(FLAG_Z), z, "opcode {opcode:#04X}");
+            assert_eq!(cpu.flag(FLAG_N), n, "opcode {opcode:#04X}");
+            assert!(cpu.flag(FLAG_V), "opcode {opcode:#04X} changed V");
+        }
+
+        // 零页 $F0 + X=$20 回绕到 $10。
+        check(
+            0xD5,
+            &[0xF0],
+            0x20,
+            0,
+            0x0010,
+            0x42,
+            &[],
+            4,
+            (true, true, false),
+        );
+
+        // 绝对,X：跨页与不跨页。
+        check(
+            0xDD,
+            &[0xFF, 0x01],
+            1,
+            0,
+            0x0200,
+            0x50,
+            &[],
+            5,
+            (false, false, true),
+        );
+        check(
+            0xDD,
+            &[0x40, 0x01],
+            1,
+            0,
+            0x0141,
+            0x40,
+            &[],
+            4,
+            (true, false, false),
+        );
+
+        // 绝对,Y：跨页与不跨页。
+        check(
+            0xD9,
+            &[0xFF, 0x01],
+            0,
+            1,
+            0x0200,
+            0x42,
+            &[],
+            5,
+            (true, true, false),
+        );
+        check(
+            0xD9,
+            &[0x40, 0x01],
+            0,
+            1,
+            0x0141,
+            0x50,
+            &[],
+            4,
+            (false, false, true),
+        );
+
+        // ($FE,X)：X=2 后指针地址回绕到零页 $00。
+        check(
+            0xC1,
+            &[0xFE],
+            2,
+            0,
+            0x0140,
+            0x40,
+            &[(0x0000, 0x40), (0x0001, 0x01)],
+            6,
+            (true, false, false),
+        );
+
+        // ($FF),Y：指针高字节从零页 $00 读取；测试跨页与不跨页。
+        check(
+            0xD1,
+            &[0xFF],
+            0,
+            1,
+            0x0200,
+            0x50,
+            &[(0x00FF, 0xFF), (0x0000, 0x01)],
+            6,
+            (false, false, true),
+        );
+        check(
+            0xD1,
+            &[0xFF],
+            0,
+            1,
+            0x0141,
+            0x42,
+            &[(0x00FF, 0x40), (0x0000, 0x01)],
+            5,
+            (true, true, false),
+        );
     }
 }
