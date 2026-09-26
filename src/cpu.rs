@@ -1081,6 +1081,71 @@ impl Cpu {
                 bus.cpu_write(addr, value)?;
                 Ok(7)
             }
+            // BCC：C = 0 时跳转
+            0x90 => {
+                let condition = !self.flag(FLAG_C);
+                self.branch(bus, condition)
+            }
+
+            // BCS：C = 1 时跳转
+            0xB0 => {
+                let condition = self.flag(FLAG_C);
+                self.branch(bus, condition)
+            }
+
+            // BPL：N = 0 时跳转
+            0x10 => {
+                let condition = !self.flag(FLAG_N);
+                self.branch(bus, condition)
+            }
+
+            // BMI：N = 1 时跳转
+            0x30 => {
+                let condition = self.flag(FLAG_N);
+                self.branch(bus, condition)
+            }
+
+            // BVC：V = 0 时跳转
+            0x50 => {
+                let condition = !self.flag(FLAG_V);
+                self.branch(bus, condition)
+            }
+
+            // BVS：V = 1 时跳转
+            0x70 => {
+                let condition = self.flag(FLAG_V);
+                self.branch(bus, condition)
+            }
+
+            // CLD：清除十进制标志
+            0xD8 => {
+                self.set_flag(FLAG_D, false);
+                Ok(2)
+            }
+
+            // CLI：清除 IRQ 屏蔽标志
+            0x58 => {
+                self.set_flag(FLAG_I, false);
+                Ok(2)
+            }
+
+            // CLV：清除溢出标志
+            0xB8 => {
+                self.set_flag(FLAG_V, false);
+                Ok(2)
+            }
+
+            // SED：设置十进制标志
+            0xF8 => {
+                self.set_flag(FLAG_D, true);
+                Ok(2)
+            }
+
+            // SEI：设置 IRQ 屏蔽标志
+            0x78 => {
+                self.set_flag(FLAG_I, true);
+                Ok(2)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -3142,5 +3207,100 @@ mod tests {
                 assert!(cpu.flag(FLAG_V));
             }
         }
+    }
+
+    #[test]
+    fn remaining_conditional_branches() {
+        // 操作码、检查的标志、该标志为 1 时是否跳转
+        let branches = [
+            (0x90, FLAG_C, false), // BCC
+            (0xB0, FLAG_C, true),  // BCS
+            (0x10, FLAG_N, false), // BPL
+            (0x30, FLAG_N, true),  // BMI
+            (0x50, FLAG_V, false), // BVC
+            (0x70, FLAG_V, true),  // BVS
+        ];
+
+        // 起始 PC、相对偏移、跳转后的 PC、跳转时的周期
+        let positions = [
+            (0x0300u16, 0x02u8, 0x0304u16, 3u8), // 正向，不跨页
+            (0x02FD, 0x01, 0x0300, 4),           // 正向，跨页
+            (0x0300, 0xFE, 0x0300, 3),           // -2，向后跳
+        ];
+
+        for (opcode, mask, take_when_set) in branches {
+            for flag_set in [false, true] {
+                for (start, offset, target, taken_cycles) in positions {
+                    let mut bus = Bus::new();
+                    let mut cpu = Cpu::new();
+                    cpu.pc = start;
+                    cpu.set_flag(mask, flag_set);
+
+                    bus.cpu_write(start, opcode).unwrap();
+                    bus.cpu_write(start + 1, offset).unwrap();
+
+                    let taken = flag_set == take_when_set;
+                    assert_eq!(
+                        cpu.step(&mut bus).unwrap(),
+                        if taken { taken_cycles } else { 2 },
+                        "opcode {opcode:#04X}, flag_set={flag_set}"
+                    );
+                    assert_eq!(cpu.pc, if taken { target } else { start + 2 });
+                    assert_eq!(cpu.flag(mask), flag_set);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_status_flag_instructions() {
+        // 操作码、目标位、执行后是否置 1
+        let cases = [
+            (0xD8, FLAG_D, false), // CLD
+            (0x58, FLAG_I, false), // CLI
+            (0xB8, FLAG_V, false), // CLV
+            (0xF8, FLAG_D, true),  // SED
+            (0x78, FLAG_I, true),  // SEI
+        ];
+
+        for (opcode, mask, set) in cases {
+            let mut bus = Bus::new();
+            let mut cpu = Cpu::new();
+            cpu.pc = 0x0300;
+
+            // 同时放入其他标志，检查指令没有误改它们。
+            cpu.status = FLAG_C | FLAG_Z | FLAG_N | FLAG_I | FLAG_D | FLAG_V;
+            if set {
+                cpu.status &= !mask;
+            }
+            let before = cpu.status;
+
+            bus.cpu_write(0x0300, opcode).unwrap();
+            assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+            assert_eq!(cpu.pc, 0x0301);
+            assert_eq!(
+                cpu.status,
+                if set { before | mask } else { before & !mask },
+                "opcode {opcode:#04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn sed_does_not_enable_decimal_arithmetic_on_nes() {
+        let mut bus = Bus::new();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x0300;
+        cpu.a = 0x09;
+        cpu.set_flag(FLAG_C, false);
+
+        bus.cpu_write(0x0300, 0xF8).unwrap(); // SED
+        bus.cpu_write(0x0301, 0x69).unwrap(); // ADC #$01
+        bus.cpu_write(0x0302, 0x01).unwrap();
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert!(cpu.flag(FLAG_D));
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.a, 0x0A); // 二进制结果，不是 BCD 的 $10
     }
 }
