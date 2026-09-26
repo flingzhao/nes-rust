@@ -997,6 +997,90 @@ impl Cpu {
                 let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
+            0x16 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                let value = self.asl(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0x56 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                let value = self.lsr(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0x36 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                let value = self.rol(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0x76 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                let value = self.ror(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0xF6 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?.wrapping_add(1);
+                self.update_zero_negative(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0xD6 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?.wrapping_sub(1);
+                self.update_zero_negative(value);
+                bus.cpu_write(addr, value)?;
+                Ok(6)
+            }
+            0x1E => {
+                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                let value = self.asl(value);
+                bus.cpu_write(addr, value)?;
+                Ok(7)
+            }
+            0x5E => {
+                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                let value = self.lsr(value);
+                bus.cpu_write(addr, value)?;
+                Ok(7)
+            }
+            0x3E => {
+                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                let value = self.rol(value);
+                bus.cpu_write(addr, value)?;
+                Ok(7)
+            }
+            0x7E => {
+                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                let value = self.ror(value);
+                bus.cpu_write(addr, value)?;
+                Ok(7)
+            }
+            0xFE => {
+                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?.wrapping_add(1);
+                self.update_zero_negative(value);
+                bus.cpu_write(addr, value)?;
+                Ok(7)
+            }
+            0xDE => {
+                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?.wrapping_sub(1);
+                self.update_zero_negative(value);
+                bus.cpu_write(addr, value)?;
+                Ok(7)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -3010,6 +3094,52 @@ mod tests {
                     assert!(cpu.flag(FLAG_C), "opcode {opcode:#04X} changed C");
                     assert!(cpu.flag(FLAG_V), "opcode {opcode:#04X} changed V");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_memory_read_modify_write() {
+        // 零页X操作码、绝对X操作码、旧值、输入C、
+        // 新值、输出C、输出Z、输出N
+        let cases = [
+            (0x16, 0x1E, 0x80, false, 0x00, true, true, false), // ASL
+            (0x56, 0x5E, 0x01, false, 0x00, true, true, false), // LSR
+            (0x36, 0x3E, 0x80, true, 0x01, true, false, false), // ROL
+            (0x76, 0x7E, 0x01, true, 0x80, true, false, true),  // ROR
+            (0xF6, 0xFE, 0xFF, true, 0x00, true, true, false),  // INC 保留 C
+            (0xD6, 0xDE, 0x00, false, 0xFF, false, false, true), // DEC 保留 C
+        ];
+
+        for (zp_opcode, abs_opcode, old, carry_in, new, carry_out, z, n) in cases {
+            let scenarios: [(u8, &[u8], u8, u16, u8); 3] = [
+                (zp_opcode, &[0xF0], 0x20, 0x0010, 6),        // 零页回绕
+                (abs_opcode, &[0x40, 0x01], 0x01, 0x0141, 7), // 不跨页
+                (abs_opcode, &[0xFF, 0x01], 0x01, 0x0200, 7), // 跨页也固定 7
+            ];
+
+            for (opcode, operands, x, target, cycles) in scenarios {
+                let mut bus = Bus::new();
+                let mut cpu = Cpu::new();
+                cpu.pc = 0x0300;
+                cpu.a = 0x5A; // 内存版本不应修改 A
+                cpu.x = x;
+                cpu.status = FLAG_V | if carry_in { FLAG_C } else { 0 };
+
+                bus.cpu_write(0x0300, opcode).unwrap();
+                for (i, byte) in operands.iter().copied().enumerate() {
+                    bus.cpu_write(0x0301 + i as u16, byte).unwrap();
+                }
+                bus.cpu_write(target, old).unwrap();
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), cycles, "opcode {opcode:#04X}");
+                assert_eq!(cpu.pc, 0x0301 + operands.len() as u16);
+                assert_eq!(cpu.a, 0x5A);
+                assert_eq!(bus.cpu_read(target).unwrap(), new, "opcode {opcode:#04X}");
+                assert_eq!(cpu.flag(FLAG_C), carry_out);
+                assert_eq!(cpu.flag(FLAG_Z), z);
+                assert_eq!(cpu.flag(FLAG_N), n);
+                assert!(cpu.flag(FLAG_V));
             }
         }
     }
