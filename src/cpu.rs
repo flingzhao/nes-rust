@@ -762,6 +762,70 @@ impl Cpu {
                 self.sbc(value);
                 Ok(4)
             }
+            0x7D => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                self.adc(value);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x79 => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                self.adc(value);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x61 => {
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                let value = bus.cpu_read(addr)?;
+                self.adc(value);
+                Ok(6)
+            }
+            0x71 => {
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.adc(value);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 6 } else { 5 })
+            }
+            0xFD => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                self.sbc(value);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0xF9 => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                self.sbc(value);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0xE1 => {
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                let value = bus.cpu_read(addr)?;
+                self.sbc(value);
+                Ok(6)
+            }
+            0xF1 => {
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.sbc(value);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 6 } else { 5 })
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -2588,5 +2652,95 @@ mod tests {
             true,
             (0xFF, false, false, false, true, 3),
         );
+    }
+
+    #[test]
+    fn adc_sbc_remaining_addressing_modes() {
+        fn check(
+            opcode: u8,
+            operands: &[u8],
+            x: u8,
+            y: u8,
+            pointer_bytes: &[(u16, u8)],
+            target: u16,
+            expected_cycles: u8,
+        ) {
+            let mut bus = Bus::new();
+            let mut cpu = Cpu::new();
+            let is_sbc = matches!(opcode, 0xFD | 0xF9 | 0xE1 | 0xF1);
+
+            cpu.pc = 0x0300;
+            cpu.x = x;
+            cpu.y = y;
+            cpu.a = if is_sbc { 0x80 } else { 0x7F };
+            cpu.set_flag(FLAG_C, is_sbc);
+
+            bus.cpu_write(0x0300, opcode).unwrap();
+            for (i, byte) in operands.iter().copied().enumerate() {
+                bus.cpu_write(0x0301 + i as u16, byte).unwrap();
+            }
+            for &(addr, byte) in pointer_bytes {
+                bus.cpu_write(addr, byte).unwrap();
+            }
+            bus.cpu_write(target, 0x01).unwrap();
+
+            assert_eq!(
+                cpu.step(&mut bus).unwrap(),
+                expected_cycles,
+                "opcode {opcode:#04X}"
+            );
+            assert_eq!(cpu.pc, 0x0301 + operands.len() as u16);
+            assert_eq!(cpu.a, if is_sbc { 0x7F } else { 0x80 });
+            assert_eq!(bus.cpu_read(target).unwrap(), 0x01);
+            assert_eq!(cpu.flag(FLAG_C), is_sbc);
+            assert!(!cpu.flag(FLAG_Z));
+            assert!(cpu.flag(FLAG_V));
+            assert_eq!(cpu.flag(FLAG_N), !is_sbc);
+        }
+
+        for opcode in [0x7D, 0xFD] {
+            check(opcode, &[0x40, 0x01], 1, 0, &[], 0x0141, 4);
+            check(opcode, &[0xFF, 0x01], 1, 0, &[], 0x0200, 5);
+        }
+
+        for opcode in [0x79, 0xF9] {
+            check(opcode, &[0x40, 0x01], 0, 1, &[], 0x0141, 4);
+            check(opcode, &[0xFF, 0x01], 0, 1, &[], 0x0200, 5);
+        }
+
+        // $FE + X=2 回绕到零页 $00，再从 $00/$01 读出 $0140。
+        for opcode in [0x61, 0xE1] {
+            check(
+                opcode,
+                &[0xFE],
+                2,
+                0,
+                &[(0x0000, 0x40), (0x0001, 0x01)],
+                0x0140,
+                6,
+            );
+        }
+
+        // 指针从零页 $FF/$00 读取；Y 分别导致不跨页、跨页。
+        for opcode in [0x71, 0xF1] {
+            check(
+                opcode,
+                &[0xFF],
+                0,
+                1,
+                &[(0x00FF, 0x40), (0x0000, 0x01)],
+                0x0141,
+                5,
+            );
+            check(
+                opcode,
+                &[0xFF],
+                0,
+                1,
+                &[(0x00FF, 0xFF), (0x0000, 0x01)],
+                0x0200,
+                6,
+            );
+        }
     }
 }
