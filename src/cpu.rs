@@ -826,6 +826,177 @@ impl Cpu {
                 let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
+            0x25 => {
+                let addr = self.fetch_byte(bus)? as u16;
+                let value = bus.cpu_read(addr)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                Ok(3)
+            }
+            0x35 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x2D => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x3D => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x39 => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x21 => {
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                let value = bus.cpu_read(addr)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                Ok(6)
+            }
+            0x31 => {
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a &= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 6 } else { 5 })
+            }
+            0x05 => {
+                let addr = self.fetch_byte(bus)? as u16;
+                let value = bus.cpu_read(addr)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                Ok(3)
+            }
+            0x15 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x0D => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x1D => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x19 => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x01 => {
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                let value = bus.cpu_read(addr)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                Ok(6)
+            }
+            0x11 => {
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a |= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 6 } else { 5 })
+            }
+            0x45 => {
+                let addr = self.fetch_byte(bus)? as u16;
+                let value = bus.cpu_read(addr)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                Ok(3)
+            }
+            0x55 => {
+                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let value = bus.cpu_read(addr)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x4D => {
+                let addr = self.fetch_word(bus)?;
+                let value = bus.cpu_read(addr)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                Ok(4)
+            }
+            0x5D => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.x as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x59 => {
+                let base = self.fetch_word(bus)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0x41 => {
+                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                let value = bus.cpu_read(addr)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                Ok(6)
+            }
+            0x51 => {
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let value = bus.cpu_read(addr)?;
+                self.a ^= value;
+                self.update_zero_negative(self.a);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                Ok(if crossed_page { 6 } else { 5 })
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -2741,6 +2912,105 @@ mod tests {
                 0x0200,
                 6,
             );
+        }
+    }
+
+    #[test]
+    fn logical_memory_modes() {
+        // 顺序：零页、零页X、绝对、绝对X、绝对Y、(间接,X)、(间接),Y
+        let opcode_groups = [
+            [0x25, 0x35, 0x2D, 0x3D, 0x39, 0x21, 0x31], // AND
+            [0x05, 0x15, 0x0D, 0x1D, 0x19, 0x01, 0x11], // ORA
+            [0x45, 0x55, 0x4D, 0x5D, 0x59, 0x41, 0x51], // EOR
+        ];
+
+        type Scenario = (
+            usize,         // 上表中的寻址方式序号
+            &'static [u8], // 指令操作数字节
+            u8,
+            u8,                   // X, Y
+            &'static [(u16, u8)], // 零页指针的预置字节
+            u16,                  // 最终读取地址
+            u8,                   // 预期周期
+        );
+
+        let scenarios: [Scenario; 10] = [
+            (0, &[0x40], 0, 0, &[], 0x0040, 3),
+            (1, &[0xF0], 0x20, 0, &[], 0x0010, 4), // 零页回绕
+            (2, &[0x40, 0x01], 0, 0, &[], 0x0140, 4),
+            (3, &[0x40, 0x01], 1, 0, &[], 0x0141, 4),
+            (3, &[0xFF, 0x01], 1, 0, &[], 0x0200, 5),
+            (4, &[0x40, 0x01], 0, 1, &[], 0x0141, 4),
+            (4, &[0xFF, 0x01], 0, 1, &[], 0x0200, 5),
+            (
+                5,
+                &[0xFE],
+                2,
+                0,
+                &[(0x0000, 0x40), (0x0001, 0x01)],
+                0x0140,
+                6,
+            ),
+            (
+                6,
+                &[0xFF],
+                0,
+                1,
+                &[(0x00FF, 0x40), (0x0000, 0x01)],
+                0x0141,
+                5,
+            ),
+            (
+                6,
+                &[0xFF],
+                0,
+                1,
+                &[(0x00FF, 0xFF), (0x0000, 0x01)],
+                0x0200,
+                6,
+            ),
+        ];
+
+        // 初始 A、内存值、按 AND/ORA/EOR 顺序排列的预期 A
+        let values = [
+            (0xA0, 0xC0, [0x80, 0xE0, 0x60]),
+            (0x55, 0x55, [0x55, 0x55, 0x00]),
+            (0x00, 0x80, [0x00, 0x80, 0x80]),
+        ];
+
+        for (operation, opcodes) in opcode_groups.iter().enumerate() {
+            for &(mode, operands, x, y, pointers, target, cycles) in &scenarios {
+                for &(initial_a, value, results) in &values {
+                    let opcode = opcodes[mode];
+                    let mut bus = Bus::new();
+                    let mut cpu = Cpu::new();
+
+                    cpu.pc = 0x0300;
+                    cpu.a = initial_a;
+                    cpu.x = x;
+                    cpu.y = y;
+                    cpu.status = FLAG_C | FLAG_V;
+
+                    bus.cpu_write(0x0300, opcode).unwrap();
+                    for (i, byte) in operands.iter().copied().enumerate() {
+                        bus.cpu_write(0x0301 + i as u16, byte).unwrap();
+                    }
+                    for &(addr, byte) in pointers {
+                        bus.cpu_write(addr, byte).unwrap();
+                    }
+                    bus.cpu_write(target, value).unwrap();
+
+                    let expected_a = results[operation];
+                    assert_eq!(cpu.step(&mut bus).unwrap(), cycles, "opcode {opcode:#04X}");
+                    assert_eq!(cpu.pc, 0x0301 + operands.len() as u16);
+                    assert_eq!(cpu.a, expected_a, "opcode {opcode:#04X}");
+                    assert_eq!(bus.cpu_read(target).unwrap(), value);
+                    assert_eq!(cpu.flag(FLAG_Z), expected_a == 0);
+                    assert_eq!(cpu.flag(FLAG_N), expected_a & 0x80 != 0);
+                    assert!(cpu.flag(FLAG_C), "opcode {opcode:#04X} changed C");
+                    assert!(cpu.flag(FLAG_V), "opcode {opcode:#04X} changed V");
+                }
+            }
         }
     }
 }
