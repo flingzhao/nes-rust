@@ -205,14 +205,14 @@ impl Cpu {
         Ok((addr, crossed_page))
     }
 
-    fn read_zero_page_word(&mut self, bus: &mut Bus, pointer: u8) -> Result<u16, String> {
+    fn read_zero_page_word(&self, bus: &mut Bus, pointer: u8) -> Result<u16, String> {
         let low = bus.cpu_read(pointer as u16)?;
         let high = bus.cpu_read(pointer.wrapping_add(1) as u16)?;
         let addr = u16::from_le_bytes([low, high]);
         Ok(addr)
     }
 
-    fn read_jmp_indirect_target(&mut self, bus: &mut Bus, pointer: u16) -> Result<u16, String> {
+    fn read_jmp_indirect_target(&self, bus: &mut Bus, pointer: u16) -> Result<u16, String> {
         let low = bus.cpu_read(pointer)?;
         let high = bus.cpu_read((pointer & 0xFF00) | (pointer.wrapping_add(1) & 0x00FF))?;
         let addr = u16::from_le_bytes([low, high]);
