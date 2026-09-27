@@ -573,15 +573,15 @@ impl Cpu {
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xBE => {
-                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x)?;
-                self.y = bus.cpu_read(addr)?;
-                self.update_zero_negative(self.y);
-                Ok(if crossed_page { 5 } else { 4 })
-            }
-            0xBC => {
                 let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y)?;
                 self.x = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.x);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0xBC => {
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x)?;
+                self.y = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.y);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x9D => {
@@ -3529,5 +3529,137 @@ mod tests {
         assert_eq!(cpu.sp, 0x02);
         assert_eq!(cpu.pc, 0x02FF); // 不得像 RTS 那样再加 1
         assert_eq!(cpu.status & 0xCF, 0xC3);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CpuTrace {
+        pc: u16,
+        a: u8,
+        x: u8,
+        y: u8,
+        p: u8,
+        sp: u8,
+        cycles: u64,
+    }
+
+    fn parse_trace(line: &str) -> CpuTrace {
+        let field = |prefix: &str| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("Missing {prefix} in: {line}"))
+        };
+
+        let hex_byte = |prefix: &str| {
+            u8::from_str_radix(field(prefix), 16)
+                .unwrap_or_else(|error| panic!("Invalid {prefix}: {error}"))
+        };
+
+        CpuTrace {
+            pc: u16::from_str_radix(
+                line.split_whitespace().next().expect("Empty trace line"),
+                16,
+            )
+            .expect("Invalid PC"),
+            a: hex_byte("A:"),
+            x: hex_byte("X:"),
+            y: hex_byte("Y:"),
+            p: hex_byte("P:") & 0xCF,
+            sp: hex_byte("SP:"),
+            cycles: field("CYC:").parse().expect("Invalid cycle count"),
+        }
+    }
+
+    #[test]
+    fn nestest_official_prefix() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures");
+
+        let rom = std::fs::read(fixture_dir.join("nestest.nes"))
+            .expect("Cannot read tests/fixtures/nestest.nes");
+
+        let reference = std::fs::read_to_string(fixture_dir.join("nestest.log"))
+            .expect("Cannot read tests/fixtures/nestest.log");
+
+        let cartridge = Cartridge::try_from(rom.as_slice()).expect("Cannot parse nestest ROM");
+
+        let mut bus = Bus::new();
+        bus.insert_cartridge(cartridge);
+
+        let mut cpu = Cpu::new();
+        cpu.pc = 0xC000;
+        cpu.a = 0;
+        cpu.x = 0;
+        cpu.y = 0;
+        cpu.status = 0x24;
+        cpu.sp = 0xFD;
+
+        let mut cycles = 7_u64;
+
+        let lines: Vec<&str> = reference
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+
+        // 执行 5003 条指令，再检查下一条执行前的状态。
+        const INSTRUCTION_COUNT: usize = 5003;
+
+        assert!(
+            lines.len() > INSTRUCTION_COUNT,
+            "Reference log is incomplete"
+        );
+
+        // 确认使用的是本测试针对的参考日志边界。
+        let boundary = parse_trace(lines[INSTRUCTION_COUNT]);
+        assert_eq!(boundary.pc, 0xC6BD);
+        assert_eq!(boundary.cycles, 14579);
+        assert_eq!(
+            lines[INSTRUCTION_COUNT].split_whitespace().nth(1),
+            Some("04")
+        );
+
+        for index in 0..=INSTRUCTION_COUNT {
+            let expected = parse_trace(lines[index]);
+
+            let actual = CpuTrace {
+                pc: cpu.pc,
+                a: cpu.a,
+                x: cpu.x,
+                y: cpu.y,
+                p: cpu.status & 0xCF,
+                sp: cpu.sp,
+                cycles,
+            };
+
+            let previous = if index == 0 {
+                "<initial state>"
+            } else {
+                lines[index - 1]
+            };
+
+            assert_eq!(
+                actual,
+                expected,
+                "Mismatch at reference line {}\nPrevious: {}\nCurrent: {}",
+                index + 1,
+                previous,
+                lines[index],
+            );
+
+            if index == INSTRUCTION_COUNT {
+                break;
+            }
+
+            let elapsed = cpu.step(&mut bus).unwrap_or_else(|error| {
+                panic!(
+                    "Execution failed at reference line {}:\n{}\n{}",
+                    index + 1,
+                    lines[index],
+                    error
+                )
+            });
+
+            cycles += u64::from(elapsed);
+        }
     }
 }
