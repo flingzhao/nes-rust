@@ -219,6 +219,31 @@ impl Cpu {
         Ok(addr)
     }
 
+    // 公共入口动作：压栈、设置 I、读取向量。
+    // vector 只由内部传入 0xFFFA 或 0xFFFE。
+    fn enter_interrupt(&mut self, bus: &mut Bus, vector: u16) -> Result<u8, String> {
+        self.push_byte(bus, (self.pc >> 8) as u8)?;
+        self.push_byte(bus, (self.pc & 0x00FF) as u8)?;
+        let stacked_status = (self.status & !0x10) | 0x20;
+        self.push_byte(bus, stacked_status)?;
+        self.set_flag(FLAG_I, true);
+        let low = bus.cpu_read(vector)?;
+        let high = bus.cpu_read(vector.wrapping_add(1))?;
+        self.pc = u16::from_le_bytes([low, high]);
+        Ok(7)
+    }
+
+    pub fn nmi(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        self.enter_interrupt(bus, 0xFFFA)
+    }
+
+    pub fn irq(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        if self.flag(FLAG_I) {
+            return Ok(0);
+        }
+        self.enter_interrupt(bus, 0xFFFE)
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -3661,5 +3686,134 @@ mod tests {
 
             cycles += u64::from(elapsed);
         }
+    }
+
+    fn interrupt_test_bus() -> Bus {
+        // iNES：1 个 16 KiB PRG，CHR RAM，Mapper 0。
+        let mut rom = vec![0u8; 16 + 0x4000];
+        rom[..4].copy_from_slice(b"NES\x1A");
+        rom[4] = 1;
+
+        let prg = &mut rom[16..];
+
+        // NMI 处理程序 $9000：RTI
+        prg[0x1000] = 0x40;
+
+        // IRQ 处理程序 $A000：RTI
+        prg[0x2000] = 0x40;
+
+        // 16 KiB PRG 在 $C000..=$FFFF 镜像。
+        prg[0x3FFA..0x3FFC].copy_from_slice(&0x9000u16.to_le_bytes());
+        prg[0x3FFE..0x4000].copy_from_slice(&0xA000u16.to_le_bytes());
+
+        let cartridge = crate::cartridge::Cartridge::try_from(rom.as_slice()).unwrap();
+
+        let mut bus = Bus::new();
+        bus.insert_cartridge(cartridge);
+        bus
+    }
+
+    #[test]
+    fn interrupt_nmi_preserves_old_status_and_returns() {
+        // 同时验证：I=0 和 I=1 时，NMI 都可以进入。
+        for old_status in [0x49u8, 0x4D] {
+            let mut bus = interrupt_test_bus();
+            let mut cpu = Cpu::new();
+            cpu.pc = 0x8123;
+            cpu.sp = 0xFD;
+            cpu.status = old_status;
+            cpu.a = 0x12;
+            cpu.x = 0x34;
+            cpu.y = 0x56;
+
+            assert_eq!(cpu.nmi(&mut bus).unwrap(), 7);
+
+            assert_eq!(cpu.pc, 0x9000);
+            assert_eq!(cpu.sp, 0xFA);
+            assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x81);
+            assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x23);
+            assert_eq!(bus.cpu_read(0x01FB).unwrap(), (old_status & !0x10) | 0x20);
+            assert_eq!(cpu.status & 0xCF, old_status | FLAG_I);
+            assert_eq!((cpu.a, cpu.x, cpu.y), (0x12, 0x34, 0x56));
+
+            // 执行处理程序中的 RTI。
+            assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+            assert_eq!(cpu.pc, 0x8123);
+            assert_eq!(cpu.sp, 0xFD);
+            assert_eq!(cpu.status & 0xCF, old_status);
+            assert_eq!((cpu.a, cpu.x, cpu.y), (0x12, 0x34, 0x56));
+        }
+    }
+
+    #[test]
+    fn interrupt_irq_uses_irq_vector_and_returns() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x8456;
+        cpu.sp = 0xFD;
+        cpu.status = 0xC9; // N、V、D、C；I=0。
+
+        assert_eq!(cpu.irq(&mut bus).unwrap(), 7);
+
+        assert_eq!(cpu.pc, 0xA000);
+        assert_eq!(cpu.sp, 0xFA);
+        assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x84);
+        assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x56);
+        assert_eq!(bus.cpu_read(0x01FB).unwrap(), 0xE9);
+        assert_eq!(cpu.status & 0xCF, 0xCD);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x8456);
+        assert_eq!(cpu.sp, 0xFD);
+        assert_eq!(cpu.status & 0xCF, 0xC9);
+    }
+
+    #[test]
+    fn interrupt_masked_irq_changes_nothing() {
+        // 故意不插卡带：被屏蔽时不应该读取中断向量。
+        let mut bus = Bus::new();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x8123;
+        cpu.sp = 0xFD;
+        cpu.status = 0xCD; // I=1。
+        cpu.a = 0x12;
+        cpu.x = 0x34;
+        cpu.y = 0x56;
+
+        for addr in 0x0100u16..=0x01FF {
+            bus.cpu_write(addr, 0xA5).unwrap();
+        }
+
+        assert_eq!(cpu.irq(&mut bus).unwrap(), 0);
+
+        assert_eq!(cpu.pc, 0x8123);
+        assert_eq!(cpu.sp, 0xFD);
+        assert_eq!(cpu.status, 0xCD);
+        assert_eq!((cpu.a, cpu.x, cpu.y), (0x12, 0x34, 0x56));
+
+        for addr in 0x0100u16..=0x01FF {
+            assert_eq!(bus.cpu_read(addr).unwrap(), 0xA5);
+        }
+    }
+
+    #[test]
+    fn interrupt_stack_wraps_within_stack_page() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x8123;
+        cpu.sp = 0x00;
+        cpu.status = 0x01;
+
+        assert_eq!(cpu.nmi(&mut bus).unwrap(), 7);
+
+        assert_eq!(cpu.sp, 0xFD);
+        assert_eq!(bus.cpu_read(0x0100).unwrap(), 0x81);
+        assert_eq!(bus.cpu_read(0x01FF).unwrap(), 0x23);
+        assert_eq!(bus.cpu_read(0x01FE).unwrap(), 0x21);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x8123);
+        assert_eq!(cpu.sp, 0x00);
+        assert_eq!(cpu.status & 0xCF, 0x01);
     }
 }
