@@ -572,6 +572,18 @@ impl Cpu {
                 self.update_zero_negative(self.a);
                 Ok(if crossed_page { 5 } else { 4 })
             }
+            0xBE => {
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x)?;
+                self.y = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.y);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
+            0xBC => {
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y)?;
+                self.x = bus.cpu_read(addr)?;
+                self.update_zero_negative(self.x);
+                Ok(if crossed_page { 5 } else { 4 })
+            }
             0x9D => {
                 let (addr, _) = self.fetch_absolute_indexed(bus, self.x)?;
                 bus.cpu_write(addr, self.a)?;
