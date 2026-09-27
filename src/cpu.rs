@@ -22,6 +22,7 @@ pub struct Cpu {
     nmi_pending: bool, // 是否锁存了待处理的 NMI
     irq_line: bool,    // 当前 IRQ 请求是否有效
     irq_mask_override: Option<bool>,
+    skip_interrupt_poll: bool,
 }
 
 impl Cpu {
@@ -37,6 +38,7 @@ impl Cpu {
             nmi_pending: false,
             irq_line: false,
             irq_mask_override: None,
+            skip_interrupt_poll: false,
         }
     }
 
@@ -68,6 +70,7 @@ impl Cpu {
 
         self.set_flag(FLAG_I, true);
         self.irq_mask_override = None;
+        self.skip_interrupt_poll = false;
 
         Ok(())
     }
@@ -239,6 +242,7 @@ impl Cpu {
         let low = bus.cpu_read(vector)?;
         let high = bus.cpu_read(vector.wrapping_add(1))?;
         self.pc = u16::from_le_bytes([low, high]);
+        self.skip_interrupt_poll = true;
         Ok(7)
     }
 
@@ -267,19 +271,24 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        // 取出后自动重置为 false，只跳过一次。
+        let skip_poll = std::mem::take(&mut self.skip_interrupt_poll);
+
         let irq_masked = self
             .irq_mask_override
             .take()
             .unwrap_or_else(|| self.flag(FLAG_I));
 
-        if self.nmi_pending {
-            let cycle = self.nmi(bus)?;
-            self.nmi_pending = false;
-            return Ok(cycle);
-        }
+        if !skip_poll {
+            if self.nmi_pending {
+                let cycles = self.nmi(bus)?;
+                self.nmi_pending = false;
+                return Ok(cycles);
+            }
 
-        if self.irq_line && !irq_masked {
-            return self.enter_interrupt(bus, 0xFFFE);
+            if self.irq_line && !irq_masked {
+                return self.enter_interrupt(bus, 0xFFFE);
+            }
         }
 
         let i_before = self.flag(FLAG_I);
@@ -1257,6 +1266,7 @@ impl Cpu {
                 let low = bus.cpu_read(0xFFFE)?;
                 let high = bus.cpu_read(0xFFFF)?;
                 self.pc = u16::from_le_bytes([low, high]);
+                self.skip_interrupt_poll = true;
                 Ok(7)
             }
             // RTI
@@ -4146,5 +4156,52 @@ mod tests {
         assert_eq!(cpu.step(&mut bus).unwrap(), 7);
         assert_eq!(cpu.pc, 0xA000);
         assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x34);
+    }
+
+    #[test]
+    fn interrupt_entry_executes_one_instruction_before_pending_nmi() {
+        for entry in ["NMI", "IRQ", "BRK"] {
+            let mut bus = interrupt_test_bus();
+            let mut cpu = signal_test_cpu();
+            cpu.status = 0; // I=0
+
+            // BRK 和填充字节；其他两种入口不会执行它。
+            bus.cpu_write(0x0200, 0x00).unwrap();
+            bus.cpu_write(0x0201, 0xEA).unwrap();
+
+            match entry {
+                "NMI" => cpu.set_nmi_line(true),
+                "IRQ" => cpu.set_irq_line(true),
+                "BRK" => {}
+                _ => unreachable!(),
+            }
+
+            // 第一次：进入中断。
+            assert_eq!(cpu.step(&mut bus).unwrap(), 7, "{entry}");
+            assert_eq!(
+                cpu.pc,
+                if entry == "NMI" { 0x9000 } else { 0xA000 },
+                "{entry}"
+            );
+            assert_eq!(cpu.sp, 0xFA, "{entry}");
+
+            // 撤销 IRQ，制造一个新的 NMI 边沿。
+            cpu.set_irq_line(false);
+            cpu.set_nmi_line(false);
+            cpu.set_nmi_line(true);
+
+            // 第二次：必须先执行处理程序第一条 RTI。
+            // 没有 skip_interrupt_poll 时，这里会错误地返回 7。
+            assert_eq!(cpu.step(&mut bus).unwrap(), 6, "{entry}");
+
+            let return_pc = if entry == "BRK" { 0x0202 } else { 0x0200 };
+            assert_eq!(cpu.pc, return_pc, "{entry}");
+            assert_eq!(cpu.sp, 0xFD, "{entry}");
+
+            // 第三次：之前等待的 NMI 没有丢失，现在进入。
+            assert_eq!(cpu.step(&mut bus).unwrap(), 7, "{entry}");
+            assert_eq!(cpu.pc, 0x9000, "{entry}");
+            assert_eq!(cpu.sp, 0xFA, "{entry}");
+        }
     }
 }
