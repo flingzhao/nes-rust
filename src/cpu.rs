@@ -212,6 +212,13 @@ impl Cpu {
         Ok(addr)
     }
 
+    fn read_jmp_indirect_target(&mut self, bus: &mut Bus, pointer: u16) -> Result<u16, String> {
+        let low = bus.cpu_read(pointer)?;
+        let high = bus.cpu_read((pointer & 0xFF00) | (pointer.wrapping_add(1) & 0x00FF))?;
+        let addr = u16::from_le_bytes([low, high]);
+        Ok(addr)
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
@@ -1145,6 +1152,25 @@ impl Cpu {
             0x78 => {
                 self.set_flag(FLAG_I, true);
                 Ok(2)
+            }
+            // PHP
+            0x08 => {
+                // NV11DIZC
+                let flags = self.status | 0x30;
+                self.push_byte(bus, flags)?;
+                Ok(3)
+            }
+            // PLP
+            0x28 => {
+                let flags = self.pop_byte(bus)? & 0xCF;
+                self.status = flags;
+                Ok(4)
+            }
+            // JMP
+            0x6C => {
+                let addr = self.fetch_word(bus)?;
+                self.pc = self.read_jmp_indirect_target(bus, addr)?;
+                Ok(5)
             }
             0xEA => Ok(2),
             _ => Err(format!(
@@ -3302,5 +3328,87 @@ mod tests {
         assert!(cpu.flag(FLAG_D));
         assert_eq!(cpu.step(&mut bus).unwrap(), 2);
         assert_eq!(cpu.a, 0x0A); // 二进制结果，不是 BCD 的 $10
+    }
+
+    #[test]
+    fn php_pushes_status_with_bits_4_and_5_set() {
+        for status in [0x00u8, 0x45, 0xCF] {
+            for initial_sp in [0xFDu8, 0x00] {
+                let mut bus = Bus::new();
+                let mut cpu = Cpu::new();
+                cpu.pc = 0x0300;
+                cpu.sp = initial_sp;
+                cpu.status = status;
+
+                bus.cpu_write(0x0300, 0x08).unwrap();
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), 3);
+                assert_eq!(cpu.pc, 0x0301);
+                assert_eq!(cpu.sp, initial_sp.wrapping_sub(1));
+                assert_eq!(cpu.status, status);
+                assert_eq!(
+                    bus.cpu_read(0x0100 | u16::from(initial_sp)).unwrap(),
+                    status | 0x30
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plp_restores_flags_and_php_serializes_them_again() {
+        for stacked in [0x00u8, 0x30, 0xCF, 0xFF, 0x82] {
+            for initial_sp in [0xFCu8, 0xFF] {
+                let mut bus = Bus::new();
+                let mut cpu = Cpu::new();
+                cpu.pc = 0x0300;
+                cpu.sp = initial_sp;
+
+                // 六个真实标志先设成与栈内容相反，验证设置和清除。
+                cpu.status = (!stacked & 0xCF) | 0x20;
+
+                bus.cpu_write(0x0300, 0x28).unwrap(); // PLP
+                bus.cpu_write(0x0301, 0x08).unwrap(); // PHP
+
+                let popped_sp = initial_sp.wrapping_add(1);
+                let stack_addr = 0x0100 | u16::from(popped_sp);
+                bus.cpu_write(stack_addr, stacked).unwrap();
+
+                assert_eq!(cpu.step(&mut bus).unwrap(), 4);
+                assert_eq!(cpu.pc, 0x0301);
+                assert_eq!(cpu.sp, popped_sp);
+                assert_eq!(cpu.status & 0xCF, stacked & 0xCF);
+
+                // 无论原栈字节的第 4/5 位是什么，PHP 都应压入 11。
+                assert_eq!(cpu.step(&mut bus).unwrap(), 3);
+                assert_eq!(cpu.pc, 0x0302);
+                assert_eq!(cpu.sp, initial_sp);
+                assert_eq!(bus.cpu_read(stack_addr).unwrap(), (stacked & 0xCF) | 0x30);
+            }
+        }
+    }
+
+    #[test]
+    fn indirect_jmp_handles_normal_and_page_boundary_pointers() {
+        for (pointer, high_addr) in [(0x0240u16, 0x0241u16), (0x02FF, 0x0200)] {
+            let mut bus = Bus::new();
+            let mut cpu = Cpu::new();
+            cpu.pc = 0x0400;
+            cpu.sp = 0xFD;
+            let status_before = cpu.status;
+
+            let [low, high] = pointer.to_le_bytes();
+            bus.cpu_write(0x0400, 0x6C).unwrap();
+            bus.cpu_write(0x0401, low).unwrap();
+            bus.cpu_write(0x0402, high).unwrap();
+
+            bus.cpu_write(pointer, 0x56).unwrap();
+            bus.cpu_write(high_addr, 0x04).unwrap();
+            bus.cpu_write(0x0300, 0x07).unwrap(); // 抓住错误的跨页读取
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 5);
+            assert_eq!(cpu.pc, 0x0456);
+            assert_eq!(cpu.sp, 0xFD);
+            assert_eq!(cpu.status, status_before);
+        }
     }
 }
