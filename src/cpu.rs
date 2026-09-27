@@ -67,6 +67,7 @@ impl Cpu {
         self.sp = self.sp.wrapping_sub(3);
 
         self.set_flag(FLAG_I, true);
+        self.irq_mask_override = None;
 
         Ok(())
     }
