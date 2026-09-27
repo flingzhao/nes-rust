@@ -1172,6 +1172,26 @@ impl Cpu {
                 self.pc = self.read_jmp_indirect_target(bus, addr)?;
                 Ok(5)
             }
+            // BRK
+            0x00 => {
+                let _ = self.fetch_byte(bus)?;
+                self.push_byte(bus, (self.pc >> 8) as u8)?;
+                self.push_byte(bus, (self.pc & 0x00FF) as u8)?;
+                self.push_byte(bus, self.status | 0x30)?;
+                self.set_flag(FLAG_I, true);
+                let low = bus.cpu_read(0xFFFE)?;
+                let high = bus.cpu_read(0xFFFF)?;
+                self.pc = u16::from_le_bytes([low, high]);
+                Ok(7)
+            }
+            // RTI
+            0x40 => {
+                self.status = self.pop_byte(bus)? & 0xCF;
+                let low = self.pop_byte(bus)?;
+                let high = self.pop_byte(bus)?;
+                self.pc = u16::from_le_bytes([low, high]);
+                Ok(6)
+            }
             0xEA => Ok(2),
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
@@ -3410,5 +3430,92 @@ mod tests {
             assert_eq!(cpu.sp, 0xFD);
             assert_eq!(cpu.status, status_before);
         }
+    }
+
+    // 放在 cpu.rs 的测试模块中。
+    fn bus_with_brk_vector(handler: u16) -> Bus {
+        const PRG_SIZE: usize = 16 * 1024;
+        const CHR_SIZE: usize = 8 * 1024;
+
+        let mut rom = vec![0u8; 16 + PRG_SIZE + CHR_SIZE];
+        rom[..4].copy_from_slice(b"NES\x1A");
+        rom[4] = 1; // 16 KiB PRG ROM
+        rom[5] = 1; // 8 KiB CHR ROM
+
+        // 16 KiB Mapper 0 镜像下，$FFFE 对应 PRG 偏移 $3FFE。
+        let vector_offset = 16 + 0x3FFE;
+        rom[vector_offset..vector_offset + 2].copy_from_slice(&handler.to_le_bytes());
+
+        let cartridge = crate::cartridge::Cartridge::try_from(rom.as_slice()).unwrap();
+
+        let mut bus = Bus::new();
+        bus.insert_cartridge(cartridge);
+        bus
+    }
+
+    #[test]
+    fn brk_and_rti_preserve_return_address_and_status() {
+        // 同时验证：I=1 不能屏蔽 BRK。
+        for initial_i in [false, true] {
+            let mut bus = bus_with_brk_vector(0x0400);
+            let mut cpu = Cpu::new();
+
+            cpu.pc = 0x0300;
+            cpu.sp = 0xFD;
+            cpu.a = 0x5A;
+            cpu.x = 0x12;
+            cpu.y = 0x34;
+            cpu.status = FLAG_C | FLAG_D | FLAG_V | FLAG_N;
+            cpu.set_flag(FLAG_I, initial_i);
+            let original_status = cpu.status;
+
+            bus.cpu_write(0x0300, 0x00).unwrap(); // BRK
+            bus.cpu_write(0x0301, 0xEA).unwrap(); // 被跳过的字节
+            bus.cpu_write(0x0302, 0xEA).unwrap(); // 返回后执行的 NOP
+            bus.cpu_write(0x0400, 0x40).unwrap(); // RTI
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+            assert_eq!(cpu.pc, 0x0400);
+            assert_eq!(cpu.sp, 0xFA);
+
+            // 单独检查栈内容，防止 BRK 和 RTI 的错误互相抵消。
+            assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x03);
+            assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x02);
+            assert_eq!(bus.cpu_read(0x01FB).unwrap(), original_status | 0x30);
+            assert_eq!(cpu.status & 0xCF, (original_status | FLAG_I) & 0xCF);
+
+            // 模拟处理程序修改标志，RTI 必须从栈恢复。
+            cpu.status = FLAG_I | FLAG_Z;
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+            assert_eq!(cpu.pc, 0x0302);
+            assert_eq!(cpu.sp, 0xFD);
+            assert_eq!(cpu.status & 0xCF, original_status & 0xCF);
+            assert_eq!((cpu.a, cpu.x, cpu.y), (0x5A, 0x12, 0x34));
+
+            assert_eq!(cpu.step(&mut bus).unwrap(), 2); // NOP
+            assert_eq!(cpu.pc, 0x0303);
+        }
+    }
+
+    #[test]
+    fn rti_wraps_stack_and_restores_exact_pc() {
+        let mut bus = Bus::new();
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x0400;
+        cpu.sp = 0xFF;
+        cpu.status = FLAG_I | FLAG_D;
+
+        bus.cpu_write(0x0400, 0x40).unwrap(); // RTI
+
+        // SP 从 $FF 回绕到 $00，再依次弹出三个字节。
+        bus.cpu_write(0x0100, 0xF3).unwrap(); // 状态，包含第 4/5 位
+        bus.cpu_write(0x0101, 0xFF).unwrap(); // PC 低字节
+        bus.cpu_write(0x0102, 0x02).unwrap(); // PC 高字节
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.sp, 0x02);
+        assert_eq!(cpu.pc, 0x02FF); // 不得像 RTS 那样再加 1
+        assert_eq!(cpu.status & 0xCF, 0xC3);
     }
 }
