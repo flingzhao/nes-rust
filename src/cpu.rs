@@ -21,6 +21,7 @@ pub struct Cpu {
     nmi_line: bool,    // 上次记录的 NMI 请求状态
     nmi_pending: bool, // 是否锁存了待处理的 NMI
     irq_line: bool,    // 当前 IRQ 请求是否有效
+    irq_mask_override: Option<bool>,
 }
 
 impl Cpu {
@@ -35,6 +36,7 @@ impl Cpu {
             nmi_line: false,
             nmi_pending: false,
             irq_line: false,
+            irq_mask_override: None,
         }
     }
 
@@ -264,20 +266,25 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        let irq_masked = self
+            .irq_mask_override
+            .take()
+            .unwrap_or_else(|| self.flag(FLAG_I));
+
         if self.nmi_pending {
             let cycle = self.nmi(bus)?;
             self.nmi_pending = false;
             return Ok(cycle);
         }
 
-        if self.irq_line && !self.flag(FLAG_I) {
-            let cycle = self.irq(bus)?;
-            return Ok(cycle);
+        if self.irq_line && !irq_masked {
+            return self.enter_interrupt(bus, 0xFFFE);
         }
 
+        let i_before = self.flag(FLAG_I);
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
-        match opcode {
+        let cycles = match opcode {
             0x85 => {
                 let addr = u16::from(self.fetch_byte(bus)?);
                 bus.cpu_write(addr, self.a)?;
@@ -1263,7 +1270,13 @@ impl Cpu {
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
             )),
+        }?;
+
+        if matches!(opcode, 0x58 | 0x78 | 0x28) {
+            self.irq_mask_override = Some(i_before);
         }
+
+        Ok(cycles)
     }
 }
 
@@ -1287,6 +1300,12 @@ mod tests {
         let mut bus = Bus::new();
         bus.insert_cartridge(cartridge);
         bus
+    }
+
+    fn write_irq_test_program(bus: &mut Bus, program: &[u8]) {
+        for (offset, &byte) in program.iter().enumerate() {
+            bus.cpu_write(0x0200 + offset as u16, byte).unwrap();
+        }
     }
 
     #[test]
@@ -4003,5 +4022,128 @@ mod tests {
         assert_eq!(cpu.step(&mut bus).unwrap(), 6); // RTI
         assert_eq!(cpu.step(&mut bus).unwrap(), 2); // NOP
         assert_eq!(cpu.pc, 0x0201);
+    }
+
+    #[test]
+    fn irq_timing_cli_allows_one_more_instruction() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        cpu.status = FLAG_I;
+
+        // CLI; NOP; NOP
+        write_irq_test_program(&mut bus, &[0x58, 0xEA, 0xEA]);
+        cpu.set_irq_line(true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // CLI
+        assert!(!cpu.flag(FLAG_I));
+        assert_eq!(cpu.pc, 0x0201);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // 仍执行 NOP
+        assert_eq!(cpu.pc, 0x0202);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7); // IRQ
+        assert_eq!(cpu.pc, 0xA000);
+        assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x02);
+        assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x02);
+    }
+
+    #[test]
+    fn irq_timing_sei_does_not_cancel_irq_allowed_by_old_i() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        cpu.status = FLAG_I;
+
+        // CLI; SEI; NOP
+        write_irq_test_program(&mut bus, &[0x58, 0x78, 0xEA]);
+        cpu.set_irq_line(true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // CLI
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // SEI
+        assert!(cpu.flag(FLAG_I));
+
+        // 使用 SEI 执行前的 I=0，仍然进入 IRQ。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0xA000);
+
+        // 采样用的是旧 I，但压栈必须保存当前状态的 I=1。
+        assert_ne!(bus.cpu_read(0x01FB).unwrap() & FLAG_I, 0);
+
+        cpu.set_irq_line(false);
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6); // RTI
+        assert_eq!(cpu.pc, 0x0202);
+        assert!(cpu.flag(FLAG_I));
+    }
+
+    #[test]
+    fn irq_timing_plp_clearing_i_delays_irq() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        cpu.status = FLAG_I;
+
+        // PLP; NOP
+        write_irq_test_program(&mut bus, &[0x28, 0xEA]);
+
+        // PLP 将从 $01FD 弹出 I=0。
+        cpu.sp = 0xFC;
+        bus.cpu_write(0x01FD, 0x20).unwrap();
+        cpu.set_irq_line(true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 4); // PLP
+        assert!(!cpu.flag(FLAG_I));
+        assert_eq!(cpu.sp, 0xFD);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // NOP
+        assert_eq!(cpu.pc, 0x0202);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0xA000);
+    }
+
+    #[test]
+    fn irq_timing_plp_setting_i_uses_old_i_for_poll() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        cpu.status = FLAG_I;
+
+        // CLI; PLP; NOP
+        write_irq_test_program(&mut bus, &[0x58, 0x28, 0xEA]);
+
+        cpu.sp = 0xFC;
+        bus.cpu_write(0x01FD, 0x24).unwrap(); // 弹出 I=1
+        cpu.set_irq_line(true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // CLI
+        assert_eq!(cpu.step(&mut bus).unwrap(), 4); // PLP
+        assert!(cpu.flag(FLAG_I));
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0xA000);
+        assert_ne!(bus.cpu_read(0x01FB).unwrap() & FLAG_I, 0);
+    }
+
+    #[test]
+    fn irq_timing_rti_uses_restored_i_without_delay() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        cpu.status = FLAG_I;
+
+        write_irq_test_program(&mut bus, &[0x40]); // RTI
+
+        // RTI 依次弹出 P、PC low、PC high。
+        cpu.sp = 0xFA;
+        bus.cpu_write(0x01FB, 0x20).unwrap(); // I=0
+        bus.cpu_write(0x01FC, 0x34).unwrap();
+        bus.cpu_write(0x01FD, 0x02).unwrap();
+
+        cpu.set_irq_line(true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x0234);
+        assert!(!cpu.flag(FLAG_I));
+
+        // 不执行 $0234 处的指令，直接进入 IRQ。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0xA000);
+        assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x34);
     }
 }
