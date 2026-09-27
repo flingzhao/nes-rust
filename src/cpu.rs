@@ -18,6 +18,9 @@ pub struct Cpu {
     sp: u8,
     pc: u16,
     status: u8,
+    nmi_line: bool,    // 上次记录的 NMI 请求状态
+    nmi_pending: bool, // 是否锁存了待处理的 NMI
+    irq_line: bool,    // 当前 IRQ 请求是否有效
 }
 
 impl Cpu {
@@ -29,6 +32,9 @@ impl Cpu {
             sp: 0,
             pc: 0,
             status: FLAG_U | FLAG_I,
+            nmi_line: false,
+            nmi_pending: false,
+            irq_line: false,
         }
     }
 
@@ -244,7 +250,31 @@ impl Cpu {
         self.enter_interrupt(bus, 0xFFFE)
     }
 
+    pub fn set_nmi_line(&mut self, asserted: bool) {
+        if !self.nmi_line && asserted {
+            self.nmi_pending = true;
+        }
+
+        // 保存当前信号状态，供下一次调用比较。
+        self.nmi_line = asserted;
+    }
+
+    pub fn set_irq_line(&mut self, asserted: bool) {
+        self.irq_line = asserted;
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
+        if self.nmi_pending {
+            let cycle = self.nmi(bus)?;
+            self.nmi_pending = false;
+            return Ok(cycle);
+        }
+
+        if self.irq_line && !self.flag(FLAG_I) {
+            let cycle = self.irq(bus)?;
+            return Ok(cycle);
+        }
+
         let instruction_pc = self.pc;
         let opcode = self.fetch_byte(bus)?;
         match opcode {
@@ -3815,5 +3845,163 @@ mod tests {
         assert_eq!(cpu.pc, 0x8123);
         assert_eq!(cpu.sp, 0x00);
         assert_eq!(cpu.status & 0xCF, 0x01);
+    }
+
+    fn signal_test_cpu() -> Cpu {
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x0200;
+        cpu.sp = 0xFD;
+        cpu.status = 0;
+        cpu
+    }
+
+    #[test]
+    fn interrupt_signal_nmi_pulse_is_latched() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        cpu.status = FLAG_I; // NMI 不受 I 屏蔽。
+
+        bus.cpu_write(0x0200, 0xEA).unwrap(); // NOP
+
+        // 请求先产生，再撤销；事件仍应被记住。
+        cpu.set_nmi_line(true);
+        cpu.set_nmi_line(false);
+
+        // setter 不应该立即进入中断。
+        assert_eq!(cpu.pc, 0x0200);
+        assert_eq!(cpu.sp, 0xFD);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0x9000);
+        assert_eq!(cpu.sp, 0xFA);
+
+        // 中断入口没有执行原位置的 NOP。
+        assert_eq!(bus.cpu_read(0x01FD).unwrap(), 0x02);
+        assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x00);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6); // RTI
+        assert_eq!(cpu.pc, 0x0200);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // NOP
+        assert_eq!(cpu.pc, 0x0201);
+    }
+
+    #[test]
+    fn interrupt_signal_nmi_needs_a_new_edge() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        bus.cpu_write(0x0200, 0xEA).unwrap();
+
+        cpu.set_nmi_line(true);
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+
+        // 持续有效，不能再次产生 NMI。
+        cpu.set_nmi_line(true);
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6); // RTI
+
+        cpu.set_nmi_line(true);
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // NOP
+        assert_eq!(cpu.pc, 0x0201);
+
+        // 撤销后重新请求，才产生新事件。
+        cpu.set_nmi_line(false);
+        cpu.set_nmi_line(true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0x9000);
+        assert_eq!(bus.cpu_read(0x01FC).unwrap(), 0x01);
+    }
+
+    #[test]
+    fn interrupt_signal_irq_remains_asserted_after_entry() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        bus.cpu_write(0x0200, 0xEA).unwrap();
+
+        cpu.set_irq_line(true);
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0xA000);
+
+        // I=1，先执行处理程序中的 RTI。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x0200);
+        assert!(!cpu.flag(FLAG_I));
+
+        // IRQ 来源未撤销，RTI 后再次进入。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0xA000);
+
+        cpu.set_irq_line(false);
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6); // RTI
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // NOP
+        assert_eq!(cpu.pc, 0x0201);
+    }
+
+    #[test]
+    fn interrupt_signal_masked_irq_can_be_withdrawn() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        cpu.status = FLAG_I;
+
+        bus.cpu_write(0x0200, 0xEA).unwrap();
+        bus.cpu_write(0x0201, 0xEA).unwrap();
+
+        cpu.set_irq_line(true);
+
+        // 被屏蔽时，正常执行指令。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.pc, 0x0201);
+        assert_eq!(cpu.sp, 0xFD);
+
+        cpu.set_irq_line(false);
+
+        // 直接设置测试初态，不是在测试 CLI 的采样延迟。
+        cpu.set_flag(FLAG_I, false);
+
+        // 已撤销的 IRQ 不应该像 NMI 一样被锁存。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.pc, 0x0202);
+        assert_eq!(cpu.sp, 0xFD);
+    }
+
+    #[test]
+    fn interrupt_signal_nmi_has_priority_without_clearing_irq() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+
+        cpu.set_irq_line(true);
+        cpu.set_nmi_line(true);
+
+        // 两者同时请求，先进入 NMI。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0x9000);
+
+        // NMI 处理程序返回，恢复 I=0。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6);
+        assert_eq!(cpu.pc, 0x0200);
+        assert_eq!(cpu.sp, 0xFD);
+
+        // 持续有效的 NMI 不重复；IRQ 请求仍然有效。
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.pc, 0xA000);
+    }
+
+    #[test]
+    fn interrupt_signal_pending_nmi_edges_coalesce() {
+        let mut bus = interrupt_test_bus();
+        let mut cpu = signal_test_cpu();
+        bus.cpu_write(0x0200, 0xEA).unwrap();
+
+        // 处理之前发生多个边沿，只记录一个 pending。
+        for _ in 0..3 {
+            cpu.set_nmi_line(true);
+            cpu.set_nmi_line(false);
+        }
+
+        assert_eq!(cpu.step(&mut bus).unwrap(), 7);
+        assert_eq!(cpu.step(&mut bus).unwrap(), 6); // RTI
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2); // NOP
+        assert_eq!(cpu.pc, 0x0201);
     }
 }
