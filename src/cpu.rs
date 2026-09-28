@@ -505,86 +505,98 @@ impl Cpu {
             }
             0x06 => {
                 let addr = u16::from(self.fetch_byte(bus)?);
-                let value = bus.cpu_read(addr)?;
-                let value = self.asl(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.asl(old);
+                bus.cpu_write(addr, new)?;
                 Ok(5)
             }
             0x46 => {
                 let addr = u16::from(self.fetch_byte(bus)?);
-                let value = bus.cpu_read(addr)?;
-                let value = self.lsr(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.lsr(old);
+                bus.cpu_write(addr, new)?;
                 Ok(5)
             }
             0x26 => {
                 let addr = u16::from(self.fetch_byte(bus)?);
-                let value = bus.cpu_read(addr)?;
-                let value = self.rol(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.rol(old);
+                bus.cpu_write(addr, new)?;
                 Ok(5)
             }
             0x66 => {
                 let addr = u16::from(self.fetch_byte(bus)?);
-                let value = bus.cpu_read(addr)?;
-                let value = self.ror(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.ror(old);
+                bus.cpu_write(addr, new)?;
                 Ok(5)
             }
             0xE6 => {
                 let addr = u16::from(self.fetch_byte(bus)?);
-                let value = bus.cpu_read(addr)?;
-                let value = self.inc(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.inc(old);
+                bus.cpu_write(addr, new)?;
                 Ok(5)
             }
             0xC6 => {
                 let addr = u16::from(self.fetch_byte(bus)?);
-                let value = bus.cpu_read(addr)?;
-                let value = self.dec(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.dec(old);
+                bus.cpu_write(addr, new)?;
                 Ok(5)
             }
             0x0E => {
                 let addr = self.fetch_word(bus)?;
-                let value = bus.cpu_read(addr)?;
-                let value = self.asl(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.asl(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x4E => {
                 let addr = self.fetch_word(bus)?;
-                let value = bus.cpu_read(addr)?;
-                let value = self.lsr(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.lsr(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x2E => {
                 let addr = self.fetch_word(bus)?;
-                let value = bus.cpu_read(addr)?;
-                let value = self.rol(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.rol(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x6E => {
                 let addr = self.fetch_word(bus)?;
-                let value = bus.cpu_read(addr)?;
-                let value = self.ror(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.ror(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0xEE => {
                 let addr = self.fetch_word(bus)?;
-                let value = bus.cpu_read(addr)?;
-                let value = self.inc(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.inc(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0xCE => {
                 let addr = self.fetch_word(bus)?;
-                let value = bus.cpu_read(addr)?;
-                let value = self.dec(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.dec(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0xB5 => {
@@ -1090,86 +1102,98 @@ impl Cpu {
             }
             0x16 => {
                 let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let value = bus.cpu_read(addr)?;
-                let value = self.asl(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.asl(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x56 => {
                 let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let value = bus.cpu_read(addr)?;
-                let value = self.lsr(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.lsr(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x36 => {
                 let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let value = bus.cpu_read(addr)?;
-                let value = self.rol(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.rol(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x76 => {
                 let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let value = bus.cpu_read(addr)?;
-                let value = self.ror(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.ror(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0xF6 => {
                 let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let value = bus.cpu_read(addr)?.wrapping_add(1);
-                self.update_zero_negative(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.inc(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0xD6 => {
                 let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let value = bus.cpu_read(addr)?.wrapping_sub(1);
-                self.update_zero_negative(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.dec(old);
+                bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x1E => {
                 let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let value = bus.cpu_read(addr)?;
-                let value = self.asl(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.asl(old);
+                bus.cpu_write(addr, new)?;
                 Ok(7)
             }
             0x5E => {
                 let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let value = bus.cpu_read(addr)?;
-                let value = self.lsr(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.lsr(old);
+                bus.cpu_write(addr, new)?;
                 Ok(7)
             }
             0x3E => {
                 let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let value = bus.cpu_read(addr)?;
-                let value = self.rol(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.rol(old);
+                bus.cpu_write(addr, new)?;
                 Ok(7)
             }
             0x7E => {
                 let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let value = bus.cpu_read(addr)?;
-                let value = self.ror(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.ror(old);
+                bus.cpu_write(addr, new)?;
                 Ok(7)
             }
             0xFE => {
                 let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let value = bus.cpu_read(addr)?.wrapping_add(1);
-                self.update_zero_negative(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.inc(old);
+                bus.cpu_write(addr, new)?;
                 Ok(7)
             }
             0xDE => {
                 let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let value = bus.cpu_read(addr)?.wrapping_sub(1);
-                self.update_zero_negative(value);
-                bus.cpu_write(addr, value)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.dec(old);
+                bus.cpu_write(addr, new)?;
                 Ok(7)
             }
             // BCC：C = 0 时跳转
@@ -4202,6 +4226,79 @@ mod tests {
             assert_eq!(cpu.step(&mut bus).unwrap(), 7, "{entry}");
             assert_eq!(cpu.pc, 0x9000, "{entry}");
             assert_eq!(cpu.sp, 0xFA, "{entry}");
+        }
+    }
+
+    #[test]
+    fn rmw_memory_writes_old_then_new_for_all_modes() {
+        // 名称、四种寻址的操作码、旧值、新值、输出 C。
+        // 所有用例的输入 C 都是 1。
+        let operations = [
+            ("ASL", [0x06u8, 0x16, 0x0E, 0x1E], 0x81u8, 0x02u8, true),
+            ("LSR", [0x46, 0x56, 0x4E, 0x5E], 0x02, 0x01, false),
+            ("ROL", [0x26, 0x36, 0x2E, 0x3E], 0x80, 0x01, true),
+            ("ROR", [0x66, 0x76, 0x6E, 0x7E], 0x02, 0x81, false),
+            ("INC", [0xE6, 0xF6, 0xEE, 0xFE], 0xFF, 0x00, true),
+            ("DEC", [0xC6, 0xD6, 0xCE, 0xDE], 0x00, 0xFF, true),
+        ];
+
+        // 操作数字节、操作数长度、X、最终地址、周期。
+        // 索引用例特意覆盖零页回绕和绝对地址跨页。
+        let modes = [
+            ([0x80u8, 0x00], 1usize, 0u8, 0x0080u16, 5u8),
+            ([0xFF, 0x00], 1, 1, 0x0000, 6),
+            ([0x80, 0x03], 2, 0, 0x0380, 6),
+            ([0xFF, 0x03], 2, 1, 0x0400, 7),
+        ];
+
+        for (name, opcodes, old, expected, expected_c) in operations {
+            for (mode_index, (operand, len, x, addr, cycles)) in modes.into_iter().enumerate() {
+                let opcode = opcodes[mode_index];
+                let mut bus = Bus::new();
+                let mut cpu = Cpu::new();
+
+                cpu.pc = 0x0200;
+                cpu.sp = 0xFD;
+                cpu.a = 0x5A;
+                cpu.x = x;
+                cpu.y = 0xA5;
+                cpu.status = FLAG_C | FLAG_V | FLAG_D | FLAG_I;
+
+                bus.cpu_write(0x0200, opcode).unwrap();
+                for (offset, &byte) in operand[..len].iter().enumerate() {
+                    bus.cpu_write(0x0201 + offset as u16, byte).unwrap();
+                }
+                bus.cpu_write(addr, old).unwrap();
+
+                // 排除布置测试数据时产生的写入。
+                let _ = bus.take_write_trace();
+
+                assert_eq!(
+                    cpu.step(&mut bus).unwrap(),
+                    cycles,
+                    "{name}, opcode={opcode:02X}"
+                );
+
+                assert_eq!(
+                    bus.take_write_trace(),
+                    vec![(addr, old), (addr, expected)],
+                    "{name}, opcode={opcode:02X}: write sequence"
+                );
+
+                assert_eq!(bus.cpu_read(addr).unwrap(), expected);
+                assert_eq!(cpu.pc, 0x0201 + len as u16);
+                assert_eq!(cpu.sp, 0xFD);
+                assert_eq!((cpu.a, cpu.x, cpu.y), (0x5A, x, 0xA5));
+
+                assert_eq!(cpu.flag(FLAG_C), expected_c);
+                assert_eq!(cpu.flag(FLAG_Z), expected == 0);
+                assert_eq!(cpu.flag(FLAG_N), expected & 0x80 != 0);
+
+                // 这些指令不应改变 V、D、I。
+                assert!(cpu.flag(FLAG_V));
+                assert!(cpu.flag(FLAG_D));
+                assert!(cpu.flag(FLAG_I));
+            }
         }
     }
 }

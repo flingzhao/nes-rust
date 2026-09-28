@@ -8,6 +8,9 @@ const CPU_RAM_MIRROR_MASK: u16 = 0x07FF;
 pub struct Bus {
     ram: [u8; CPU_RAM_SIZE],
     cartridge: Option<Cartridge>,
+
+    #[cfg(test)]
+    write_trace: Vec<(u16, u8)>,
 }
 
 impl Bus {
@@ -15,6 +18,8 @@ impl Bus {
         Self {
             ram: [0; CPU_RAM_SIZE],
             cartridge: None,
+            #[cfg(test)]
+            write_trace: Vec::new(),
         }
     }
 
@@ -41,12 +46,19 @@ impl Bus {
     }
 
     pub fn cpu_write(&mut self, addr: u16, data: u8) -> Result<(), String> {
+        #[cfg(test)]
+        self.write_trace.push((addr, data));
         if addr > CPU_RAM_MAPPED_END {
             return Err(format!("unimplemented address {addr:#06X}"));
         }
         let index = usize::from(addr & CPU_RAM_MIRROR_MASK);
         self.ram[index] = data;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_write_trace(&mut self) -> Vec<(u16, u8)> {
+        std::mem::take(&mut self.write_trace)
     }
 }
 
