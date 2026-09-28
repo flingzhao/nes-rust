@@ -1,4 +1,5 @@
 use crate::cartridge::{self, Cartridge};
+use crate::ppu::Ppu;
 
 const CPU_RAM_SIZE: usize = 0x800;
 // const NES_PPU_REG_ADDR: usize = 0x2000;
@@ -8,6 +9,7 @@ const CPU_RAM_MIRROR_MASK: u16 = 0x07FF;
 pub struct Bus {
     ram: [u8; CPU_RAM_SIZE],
     cartridge: Option<Cartridge>,
+    ppu: Ppu,
 
     #[cfg(test)]
     write_trace: Vec<(u16, u8)>,
@@ -20,6 +22,7 @@ impl Bus {
             cartridge: None,
             #[cfg(test)]
             write_trace: Vec::new(),
+            ppu: Ppu::new(),
         }
     }
 
@@ -59,6 +62,17 @@ impl Bus {
     #[cfg(test)]
     pub(crate) fn take_write_trace(&mut self) -> Vec<(u16, u8)> {
         std::mem::take(&mut self.write_trace)
+    }
+
+    pub fn ppu(&self) -> &Ppu {
+        &self.ppu
+    }
+
+    pub(crate) fn clock_cpu_cycle(&mut self) {
+        // 调用三次 self.ppu.clock()。
+        self.ppu.clock();
+        self.ppu.clock();
+        self.ppu.clock();
     }
 }
 
