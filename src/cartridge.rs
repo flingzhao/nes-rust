@@ -125,6 +125,37 @@ impl Cartridge {
 
         Ok(self.prg_rom[relative & mask])
     }
+
+    pub fn ppu_read(&self, addr: u16) -> Result<u8, String> {
+        if addr > 0x1FFF {
+            return Err(format!(
+                "ppu cannot read address above 0x1FFF, you read {addr:0x}"
+            ));
+        }
+
+        let value = match &self.chr {
+            ChrMemory::Rom(data) => data[addr as usize],
+            ChrMemory::Ram(data) => data[addr as usize],
+        };
+        Ok(value)
+    }
+
+    pub fn ppu_write(&mut self, addr: u16, value: u8) -> Result<(), String> {
+        if addr > 0x1FFF {
+            return Err(format!(
+                "ppu cannot write address above 0x1FFF, you write {addr:0x}"
+            ));
+        }
+
+        if let ChrMemory::Ram(data) = &mut self.chr {
+            data[addr as usize] = value;
+        }
+        Ok(())
+    }
+
+    pub fn mirroring(&self) -> &Mirroring {
+        &self.header.mirroring
+    }
 }
 
 impl TryFrom<&[u8]> for Cartridge {
