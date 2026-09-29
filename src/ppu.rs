@@ -135,6 +135,13 @@ impl Ppu {
         Ok(())
     }
 
+    /// 渲染关闭时，PPUDATA 访问后的地址递增。
+    // 根据控制寄存器中的increment位(bit 2)的值决定增加v寄存器的coarse_x(bit 0-4)还是coarse_y(bit 5-9)
+    fn increment_vram_address(&mut self) {
+        let increment = if self.ctrl & 0x04 != 0 { 32 } else { 1 };
+        self.v = self.v.wrapping_add(increment) & 0x7FFF;
+    }
+
     // addr 是 CPU 访问 PPU 寄存器的地址。
     pub fn cpu_read(&mut self, addr: u16, cartridge: &Cartridge) -> Result<u8, String> {
         let addr = addr & 0x07;
@@ -165,8 +172,7 @@ impl Ppu {
                     old
                 };
 
-                let increment = if self.ctrl & 0x04 != 0 { 32 } else { 1 };
-                self.v = self.v.wrapping_add(increment) & 0x7FFF;
+                self.increment_vram_address();
 
                 value
             }
@@ -207,9 +213,7 @@ impl Ppu {
             }
             0x0007 => {
                 self.write(self.v & 0x3FFF, value, cartridge)?;
-                // 根据控制寄存器中的increment位(bit 2)的值决定增加v寄存器的coarse_x(bit 0-4)还是coarse_y(bit 5-9)
-                let increment = if self.ctrl & 0x04 != 0 { 32 } else { 1 };
-                self.v = self.v.wrapping_add(increment) & 0x7FFF;
+                self.increment_vram_address();
             }
             _ => return Err(format!("unimplemented PPU register write: {addr:#04X}")),
         }
