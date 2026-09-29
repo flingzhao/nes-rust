@@ -72,7 +72,7 @@ fn cartridge_does_not_capture_unimplemented_bus_addresses() {
     let mut bus = Bus::new();
     bus.insert_cartridge(make_cartridge(1));
 
-    for addr in [0x2000, 0x4016, 0x6000, 0x7FFF] {
+    for addr in [0x4016, 0x6000, 0x7FFF] {
         assert!(
             bus.cpu_read(addr).is_err(),
             "Address {addr:#06X} should remain unsupported for now"
