@@ -40,6 +40,16 @@ pub struct Ppu {
     frame: u64,
     nametable_ram: [u8; 2048],
     palette_ram: [u8; 32],
+
+    ctrl: u8,
+    status: u8,
+
+    v: u16,            // 当前 VRAM 地址，内部保留 15 位
+    t: u16,            // 临时地址，后续滚动也会使用
+    write_latch: bool, // false：下一次写地址高字节；true：写低字节
+
+    read_buffer: u8, // PPUDATA 的延迟读取缓冲
+    io_latch: u8,    // 最近一次寄存器接口的数据值，简化模拟 open bus
 }
 
 impl Ppu {
@@ -50,6 +60,13 @@ impl Ppu {
             frame: 0,
             nametable_ram: [0u8; 2048],
             palette_ram: [0u8; 32],
+            ctrl: 0,
+            status: 0,
+            v: 0,
+            t: 0,
+            write_latch: false,
+            read_buffer: 0,
+            io_latch: 0,
         }
     }
 
@@ -113,7 +130,88 @@ impl Ppu {
                 let index = palette_index(addr);
                 self.palette_ram[index] = value & 0x3F;
             }
-            _ => unreachable!("address wa masked to 14 bits"),
+            _ => unreachable!("address was masked to 14 bits"),
+        }
+        Ok(())
+    }
+
+    // addr 是 CPU 访问 PPU 寄存器的地址。
+    pub fn cpu_read(&mut self, addr: u16, cartridge: &Cartridge) -> Result<u8, String> {
+        let addr = addr & 0x07;
+        let value = match addr {
+            0x0002 => {
+                let v = (self.status & 0xE0) | (self.io_latch & 0x1F);
+                self.status &= 0b0111_1111;
+                self.write_latch = false;
+                v
+            }
+            0x0000 | 0x0006 => self.io_latch,
+            0x0007 => {
+                // 如果是从nametable中读取，会有一个周期的延迟，也就是说read_buffer保存着上次读取的值还没有被使用，
+                // 所以需要先保存上一个周期读取的数据。
+                // 如果是从palette中读取直接返回,同时用 addr - 0x1000 对应的名称表数据更新 read_buffer
+                let addr = self.v & 0x3FFF;
+
+                let value = if addr >= 0x3F00 {
+                    // 调色板立即返回；缓冲从下方名称表地址补充。
+                    let palette = self.read(addr, cartridge)?;
+                    self.read_buffer = self.read(addr - 0x1000, cartridge)?;
+
+                    (palette & 0x3F) | (self.io_latch & 0xC0)
+                } else {
+                    // 返回旧缓冲，再装入当前地址的数据。
+                    let old = self.read_buffer;
+                    self.read_buffer = self.read(addr, cartridge)?;
+                    old
+                };
+
+                let increment = if self.ctrl & 0x04 != 0 { 32 } else { 1 };
+                self.v = self.v.wrapping_add(increment) & 0x7FFF;
+
+                value
+            }
+            _ => return Err(format!("unimplemented cpu read addr: {:0x}", addr)),
+        };
+
+        self.io_latch = value;
+        Ok(value)
+    }
+
+    pub fn cpu_write(
+        &mut self,
+        addr: u16,
+        value: u8,
+        cartridge: &mut Cartridge,
+    ) -> Result<(), String> {
+        let addr = addr & 0x07;
+        self.io_latch = value;
+        match addr {
+            0x0000 => {
+                self.ctrl = value;
+                // 控制寄存器的nametable_x(bit 0)写入 t寄存器的nametable_x(bit 10)
+                // 控制寄存器的nametable_y(bit 1)写入 t寄存器的nametable_y(bit 11)
+                self.t = (self.t & !0x0C00) | (u16::from(value & 0x03) << 10);
+            }
+            0x0002 => {}
+            0x0006 => {
+                if self.write_latch {
+                    self.t = (self.t & 0xFF00) | u16::from(value);
+                    self.v = self.t;
+                    self.write_latch = false;
+                } else {
+                    self.t = u16::from(value & 0x3F) << 8 | (self.t & 0x00FF);
+                    // 清除bit 14
+                    self.t &= 0xBFFF;
+                    self.write_latch = true;
+                }
+            }
+            0x0007 => {
+                self.write(self.v & 0x3FFF, value, cartridge)?;
+                // 根据控制寄存器中的increment位(bit 2)的值决定增加v寄存器的coarse_x(bit 0-4)还是coarse_y(bit 5-9)
+                let increment = if self.ctrl & 0x04 != 0 { 32 } else { 1 };
+                self.v = self.v.wrapping_add(increment) & 0x7FFF;
+            }
+            _ => return Err(format!("unimplemented PPU register write: {addr:#04X}")),
         }
         Ok(())
     }
@@ -303,5 +401,125 @@ mod tests {
         ppu.write(0x2F00, 0xAB, &mut cart).unwrap();
         ppu.write(0x3F00, 0x12, &mut cart).unwrap();
         assert_eq!(ppu.read(0x2F00, &cart).unwrap(), 0xAB);
+    }
+
+    fn set_ppu_address(ppu: &mut Ppu, cart: &mut Cartridge, addr: u16) {
+        ppu.cpu_write(0x2006, (addr >> 8) as u8, cart).unwrap();
+        ppu.cpu_write(0x2006, addr as u8, cart).unwrap();
+    }
+
+    #[test]
+    fn ppu_register_data_write_increments_by_one_or_32() {
+        let mut cart = ppu_test_cartridge(true, false);
+        let mut ppu = Ppu::new();
+
+        set_ppu_address(&mut ppu, &mut cart, 0x2000);
+        ppu.cpu_write(0x2007, 0xAA, &mut cart).unwrap();
+        ppu.cpu_write(0x2007, 0xBB, &mut cart).unwrap();
+
+        assert_eq!(ppu.read(0x2000, &cart).unwrap(), 0xAA);
+        assert_eq!(ppu.read(0x2001, &cart).unwrap(), 0xBB);
+        assert_eq!(ppu.v, 0x2002);
+
+        ppu.cpu_write(0x2000, 0x04, &mut cart).unwrap();
+        set_ppu_address(&mut ppu, &mut cart, 0x2100);
+
+        ppu.cpu_write(0x2007, 0x11, &mut cart).unwrap();
+        ppu.cpu_write(0x2007, 0x22, &mut cart).unwrap();
+
+        assert_eq!(ppu.read(0x2100, &cart).unwrap(), 0x11);
+        assert_eq!(ppu.read(0x2120, &cart).unwrap(), 0x22);
+        assert_eq!(ppu.v, 0x2140);
+    }
+
+    #[test]
+    fn ppu_register_palette_read_is_immediate_and_refills_buffer() {
+        let mut cart = ppu_test_cartridge(true, false);
+        let mut ppu = Ppu::new();
+
+        ppu.write(0x3F00, 0x2A, &mut cart).unwrap();
+        ppu.write(0x2F00, 0x55, &mut cart).unwrap();
+        ppu.write(0x2000, 0x77, &mut cart).unwrap();
+
+        set_ppu_address(&mut ppu, &mut cart, 0x3F00);
+
+        // 设置 I/O latch 高两位；写 STATUS 不改变状态。
+        ppu.cpu_write(0x2002, 0xC0, &mut cart).unwrap();
+
+        assert_eq!(ppu.cpu_read(0x2007, &cart).unwrap(), 0xEA);
+        assert_eq!(ppu.v, 0x3F01);
+
+        set_ppu_address(&mut ppu, &mut cart, 0x2000);
+
+        // 改地址不会清除读取缓冲。
+        assert_eq!(ppu.cpu_read(0x2007, &cart).unwrap(), 0x55);
+        assert_eq!(ppu.cpu_read(0x2007, &cart).unwrap(), 0x77);
+    }
+
+    #[test]
+    fn ppu_register_status_clears_vblank_and_address_latch() {
+        let mut cart = ppu_test_cartridge(false, false);
+        let mut ppu = Ppu::new();
+
+        ppu.status = 0xE0;
+        ppu.read_buffer = 0xAB;
+
+        ppu.cpu_write(0x2006, 0x3F, &mut cart).unwrap();
+        assert!(ppu.write_latch);
+
+        // 返回旧状态高三位 + 最近写入值的低五位。
+        assert_eq!(ppu.cpu_read(0x2002, &cart).unwrap(), 0xFF);
+        assert_eq!(ppu.status, 0x60);
+        assert!(!ppu.write_latch);
+        assert_eq!(ppu.read_buffer, 0xAB);
+
+        set_ppu_address(&mut ppu, &mut cart, 0x2100);
+        ppu.cpu_write(0x2007, 0x42, &mut cart).unwrap();
+
+        assert_eq!(ppu.read(0x2100, &cart).unwrap(), 0x42);
+    }
+
+    #[test]
+    fn ppu_register_address_and_ctrl_update_correct_bits() {
+        let mut cart = ppu_test_cartridge(false, false);
+        let mut ppu = Ppu::new();
+
+        ppu.t = 0x73AA;
+        ppu.v = 0x1234;
+
+        ppu.cpu_write(0x2000, 0x03, &mut cart).unwrap();
+        assert_eq!(ppu.t, 0x7FAA);
+        assert_eq!(ppu.v, 0x1234);
+
+        ppu.cpu_write(0x2006, 0xFF, &mut cart).unwrap();
+        assert_eq!(ppu.t, 0x3FAA); // 高字节仅保留六位。
+        assert_eq!(ppu.v, 0x1234); // 第一次写不更新 v。
+
+        ppu.cpu_write(0x2006, 0xFF, &mut cart).unwrap();
+        assert_eq!(ppu.v, 0x3FFF);
+
+        ppu.cpu_write(0x2007, 0x2A, &mut cart).unwrap();
+        assert_eq!(ppu.v, 0x4000); // 内部 v 保留 15 位。
+
+        ppu.cpu_write(0x2007, 0x66, &mut cart).unwrap();
+        assert_eq!(ppu.read(0x0000, &cart).unwrap(), 0x66);
+    }
+
+    #[test]
+    fn ppu_register_bus_mirrors_cpu_register_addresses() {
+        let cart = ppu_test_cartridge(false, false);
+        let mut bus = crate::bus::Bus::new();
+        bus.insert_cartridge(cart);
+
+        // $200E 是 $2006 的镜像，$200F 是 $2007 的镜像。
+        bus.cpu_write(0x200E, 0x20).unwrap();
+        bus.cpu_write(0x200E, 0x00).unwrap();
+        bus.cpu_write(0x200F, 0x5A).unwrap();
+
+        bus.cpu_write(0x2006, 0x20).unwrap();
+        bus.cpu_write(0x2006, 0x00).unwrap();
+
+        assert_eq!(bus.cpu_read(0x200F).unwrap(), 0); // 初始缓冲
+        assert_eq!(bus.cpu_read(0x2007).unwrap(), 0x5A);
     }
 }

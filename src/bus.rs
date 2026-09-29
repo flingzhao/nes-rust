@@ -36,6 +36,13 @@ impl Bus {
                 let index = usize::from(addr & CPU_RAM_MIRROR_MASK);
                 Ok(self.ram[index])
             }
+            0x2000..=0x3FFF => {
+                let cartridge = self
+                    .cartridge
+                    .as_mut()
+                    .ok_or_else(|| "No cartridge inserted".to_string())?;
+                Ok(self.ppu.cpu_read(addr, cartridge)?)
+            }
             0x8000..=0xFFFF => {
                 let cartridge = self
                     .cartridge
@@ -51,11 +58,19 @@ impl Bus {
     pub fn cpu_write(&mut self, addr: u16, data: u8) -> Result<(), String> {
         #[cfg(test)]
         self.write_trace.push((addr, data));
-        if addr > CPU_RAM_MAPPED_END {
+        if addr > 0x3FFF {
             return Err(format!("unimplemented address {addr:#06X}"));
         }
-        let index = usize::from(addr & CPU_RAM_MIRROR_MASK);
-        self.ram[index] = data;
+        if addr <= CPU_RAM_MAPPED_END {
+            let index = usize::from(addr & CPU_RAM_MIRROR_MASK);
+            self.ram[index] = data;
+        } else if addr > CPU_RAM_MAPPED_END && addr <= 0x3FFF {
+            let cartridge = self
+                .cartridge
+                .as_mut()
+                .ok_or_else(|| "No cartridge inserted".to_string())?;
+            self.ppu.cpu_write(addr, data, cartridge)?;
+        }
         Ok(())
     }
 
