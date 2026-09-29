@@ -72,6 +72,14 @@ impl Ppu {
 
     /// 推进一个 PPU 周期。
     pub fn clock(&mut self) {
+        if self.dot == 1 && self.scanline == 241 {
+            self.status = self.status | 0x80;
+        }
+
+        if self.dot == 1 && self.scanline == 261 {
+            self.status = self.status & 0x1F;
+        }
+
         self.dot += 1;
         if self.dot == 341_u16 {
             self.dot = 0;
@@ -94,6 +102,10 @@ impl Ppu {
 
     pub fn frame(&self) -> u64 {
         self.frame
+    }
+
+    pub fn nmi_line(&self) -> bool {
+        return self.status & 0x80 != 0 && self.ctrl & 0x80 != 0;
     }
 
     pub fn read(&self, addr: u16, cartridge: &Cartridge) -> Result<u8, String> {
@@ -525,5 +537,79 @@ mod tests {
 
         assert_eq!(bus.cpu_read(0x200F).unwrap(), 0); // 初始缓冲
         assert_eq!(bus.cpu_read(0x2007).unwrap(), 0x5A);
+    }
+
+    #[test]
+    fn ppu_vblank_starts_at_241_dot_1() {
+        let mut ppu = Ppu::new();
+
+        // 到达待处理位置 (241, 1)，尚未处理该 tick。
+        for _ in 0..(241 * 341 + 1) {
+            ppu.clock();
+        }
+
+        assert_eq!((ppu.scanline(), ppu.dot()), (241, 1));
+        assert_eq!(ppu.status & 0x80, 0);
+
+        ppu.clock();
+
+        assert_eq!((ppu.scanline(), ppu.dot()), (241, 2));
+        assert_ne!(ppu.status & 0x80, 0);
+
+        // 未开启 NMI，但 VBlank 标志仍然会设置。
+        assert!(!ppu.nmi_line());
+    }
+
+    #[test]
+    fn ppu_vblank_prerender_clears_status_flags() {
+        let mut ppu = Ppu::new();
+
+        for _ in 0..(261 * 341 + 1) {
+            ppu.clock();
+        }
+
+        assert_eq!((ppu.scanline(), ppu.dot()), (261, 1));
+
+        // 同时验证 Sprite 0 Hit / Overflow 的清除。
+        ppu.status |= 0xE0;
+        ppu.clock();
+
+        assert_eq!(ppu.status & 0xE0, 0);
+        assert!(!ppu.nmi_line());
+    }
+
+    #[test]
+    fn ppu_vblank_nmi_line_tracks_ctrl_and_status() {
+        let mut cart = ppu_test_cartridge(false, false);
+        let mut ppu = Ppu::new();
+
+        // 没有 VBlank，单独打开 NMI 不产生请求。
+        ppu.cpu_write(0x2000, 0x80, &mut cart).unwrap();
+        assert!(!ppu.nmi_line());
+
+        for _ in 0..(241 * 341 + 2) {
+            ppu.clock();
+        }
+        assert!(ppu.nmi_line());
+
+        // 关闭 NMI 不清除 VBlank。
+        ppu.cpu_write(0x2000, 0x00, &mut cart).unwrap();
+        assert!(!ppu.nmi_line());
+        assert_ne!(ppu.status & 0x80, 0);
+
+        // VBlank 期间重新打开开关，立即重新产生有效状态。
+        ppu.cpu_write(0x2000, 0x80, &mut cart).unwrap();
+        assert!(ppu.nmi_line());
+
+        // STATUS 返回旧的 VBlank 标志，随后清除它。
+        let status = ppu.cpu_read(0x2002, &cart).unwrap();
+        assert_ne!(status & 0x80, 0);
+        assert!(!ppu.nmi_line());
+
+        // 读取之后继续推进，不应在同一 VBlank 内自动重新置位。
+        for _ in 0..20 {
+            ppu.clock();
+        }
+        assert_eq!(ppu.status & 0x80, 0);
     }
 }

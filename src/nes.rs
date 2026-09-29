@@ -16,9 +16,12 @@ impl Nes {
     }
 
     pub fn step(&mut self) -> Result<u8, String> {
+        self.cpu.set_nmi_line(self.bus.ppu().nmi_line());
         let cycle = self.cpu.step(&mut self.bus)?;
         for _ in 0..cycle {
-            self.bus.clock_cpu_cycle();
+            for asserted in self.bus.clock_cpu_cycle() {
+                self.cpu.set_nmi_line(asserted);
+            }
         }
 
         self.cpu_cycles = self.cpu_cycles.wrapping_add(cycle as u64);
@@ -103,5 +106,54 @@ mod tests {
         assert_eq!(nes.step().unwrap(), 7);
         assert_eq!(nes.cpu_cycles(), 7);
         assert_eq!(nes.bus().ppu().dot(), 21);
+    }
+
+    #[test]
+    fn system_vblank_drives_cpu_nmi_once_per_edge() {
+        use crate::cartridge::Cartridge;
+
+        let mut rom = vec![0u8; 16 + 0x4000];
+        rom[..4].copy_from_slice(b"NES\x1A");
+        rom[4] = 1;
+
+        let prg = &mut rom[16..];
+        prg[..3].copy_from_slice(&[0x4C, 0x00, 0x80]); // JMP $8000
+        prg[0x1000] = 0x40; // $9000: RTI
+
+        prg[0x3FFA..0x3FFC].copy_from_slice(&0x9000u16.to_le_bytes());
+        prg[0x3FFC..0x3FFE].copy_from_slice(&0x8000u16.to_le_bytes());
+
+        let cart = Cartridge::try_from(rom.as_slice()).unwrap();
+        let mut bus = Bus::new();
+        bus.insert_cartridge(cart);
+        bus.cpu_write(0x2000, 0x80).unwrap();
+
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut bus).unwrap();
+        let mut nes = Nes::new(cpu, bus);
+
+        // 每条 JMP 为 3 CPU 周期，即 9 PPU ticks。
+        // 第 9132 条 JMP 推进期间跨过 VBlank 置位时刻。
+        for _ in 0..9132 {
+            assert_eq!(nes.step().unwrap(), 3);
+        }
+
+        assert!(nes.bus().ppu().nmi_line());
+
+        let before = nes.cpu_cycles();
+
+        assert_eq!(nes.step().unwrap(), 7); // NMI 入口
+        assert_eq!(nes.cpu_cycles(), before + 7);
+
+        // 压栈返回地址应为 $8000。
+        assert_eq!(nes.bus.cpu_read(0x01FD).unwrap(), 0x80);
+        assert_eq!(nes.bus.cpu_read(0x01FC).unwrap(), 0x00);
+
+        assert_eq!(nes.step().unwrap(), 6); // RTI
+
+        // 信号持续有效，但没有新边沿，不能不断重入。
+        assert!(nes.bus().ppu().nmi_line());
+        assert_eq!(nes.step().unwrap(), 3); // JMP $8000
+        assert_eq!(nes.step().unwrap(), 3);
     }
 }
