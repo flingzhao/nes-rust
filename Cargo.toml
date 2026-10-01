@@ -3,4 +3,13 @@ name = "nes"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+desktop = ["dep:sdl2"]
+
 [dependencies]
+sdl2 = { version = "0.38", optional = true, features = ["bundled", "static-link"] }
+
+[[bin]]
+name = "pattern-viewer"
+path = "src/bin/pattern_viewer.rs"
+required-features = ["desktop"]
