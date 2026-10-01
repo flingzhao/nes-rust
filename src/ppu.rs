@@ -1,5 +1,11 @@
 use crate::cartridge::{Cartridge, Mirroring};
 
+const COARSE_X_MASK: u16 = 0x001F;
+const COARSE_Y_MASK: u16 = 0x03E0;
+const FINE_Y_MASK: u16 = 0x7000;
+const SCROLL_X_MASK: u16 = 0x041F;
+const SCROLL_Y_MASK: u16 = 0x7BE0;
+
 // Horizontal mirroring:
 // 0x0000-0x03FF => 0x0000-0x03FF
 // 0x0400-0x07FF => 0x0000-0x03FF
@@ -50,6 +56,8 @@ pub struct Ppu {
 
     read_buffer: u8, // PPUDATA 的延迟读取缓冲
     io_latch: u8,    // 最近一次寄存器接口的数据值，简化模拟 open bus
+
+    fine_x: u8,
 }
 
 impl Ppu {
@@ -67,6 +75,7 @@ impl Ppu {
             write_latch: false,
             read_buffer: 0,
             io_latch: 0,
+            fine_x: 0,
         }
     }
 
@@ -211,16 +220,32 @@ impl Ppu {
                 self.t = (self.t & !0x0C00) | (u16::from(value & 0x03) << 10);
             }
             0x0002 => {}
-            0x0006 => {
-                if self.write_latch {
-                    self.t = (self.t & 0xFF00) | u16::from(value);
-                    self.v = self.t;
-                    self.write_latch = false;
+            0x0005 => {
+                // 位：  14—12    11      10       9—5       4—0
+                // 含义：fine Y   纵向表  横向表   coarse Y  coarse X
+                if self.write_latch == false {
+                    // self.t = (self.t & 0xFFE0) | u16::from(value >> 3); // t.coarse_X = value >> 3
+                    self.t = (self.t & !COARSE_X_MASK) | u16::from(value >> 3); // t.coarse_X = value >> 3
+                    self.fine_x = value & 0x07;
+                    self.write_latch = true;
                 } else {
+                    // self.t = (self.t & 0b_1111_1100_0001_1111) | u16::from(value >> 3); // t.coarse_y = value >> 3
+                    self.t = (self.t & !COARSE_Y_MASK) | u16::from(value >> 3) << 5; // t.coarse_y = value >> 3
+                    // 替换bit12-14
+                    self.t = (self.t & !FINE_Y_MASK) | u16::from(value & 0x07) << 12; // t.fine_y = value >> 3
+                    self.write_latch = false;
+                }
+            }
+            0x0006 => {
+                if self.write_latch == false {
                     self.t = u16::from(value & 0x3F) << 8 | (self.t & 0x00FF);
                     // 清除bit 14
                     self.t &= 0xBFFF;
                     self.write_latch = true;
+                } else {
+                    self.t = (self.t & 0xFF00) | u16::from(value);
+                    self.v = self.t;
+                    self.write_latch = false;
                 }
             }
             0x0007 => {
@@ -230,6 +255,52 @@ impl Ppu {
             _ => return Err(format!("unimplemented PPU register write: {addr:#04X}")),
         }
         Ok(())
+    }
+
+    // 前进一个图块(8*8)
+    fn increment_scroll_x(&mut self) {
+        match self.v & COARSE_X_MASK {
+            0x0000..=0x001E => self.v += 1,
+            0x001F => {
+                self.v = self.v & !COARSE_X_MASK;
+                self.v = self.v ^ (1_u16 << 10); // flip bit 10
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // 前进一行像素
+    fn increment_scroll_y(&mut self) {
+        let fine_y = (self.v >> 12) & 0x07;
+        match fine_y {
+            0x00..=0x06 => self.v = (self.v & !FINE_Y_MASK) | (fine_y + 1) << 12,
+            0x07 => {
+                self.v = self.v & !FINE_Y_MASK;
+                // 处理coarse_y
+                let coarse_y = (self.v & COARSE_Y_MASK) >> 5;
+                match coarse_y {
+                    29 => {
+                        self.v = self.v ^ (1_u16 << 11); // flip bit 11
+                        self.v &= !COARSE_Y_MASK; // coarse_y = 0
+                    }
+                    31 => {
+                        self.v &= !COARSE_Y_MASK; // coarse_y = 0
+                    }
+                    _ => {
+                        self.v = (self.v & !COARSE_Y_MASK) | (coarse_y + 1) << 5; // coarse_y += 1
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn copy_scroll_x(&mut self) {
+        self.v = (self.v & !SCROLL_X_MASK) | (self.t & SCROLL_X_MASK);
+    }
+
+    fn copy_scroll_y(&mut self) {
+        self.v = (self.v & !SCROLL_Y_MASK) | (self.t & SCROLL_Y_MASK);
     }
 }
 
@@ -611,5 +682,151 @@ mod tests {
             ppu.clock();
         }
         assert_eq!(ppu.status & 0x80, 0);
+    }
+
+    #[cfg(test)]
+    mod scroll_tests {
+        use super::*;
+        // 如果父模块没有导入 Cartridge，在这里导入它。
+
+        fn cartridge() -> Cartridge {
+            let mut bytes = vec![0u8; 16 + 16 * 1024];
+            bytes[..4].copy_from_slice(b"NES\x1A");
+            bytes[4] = 1; // 16 KiB PRG，CHR RAM
+            Cartridge::try_from(bytes.as_slice()).unwrap()
+        }
+
+        #[test]
+        fn scroll_writes_replace_fields_without_changing_v() {
+            let mut ppu = Ppu::new();
+            let mut cart = cartridge();
+
+            ppu.v = 0x1234;
+            ppu.cpu_write(0x2000, 3, &mut cart).unwrap();
+
+            ppu.cpu_write(0x2005, 19, &mut cart).unwrap();
+            assert_eq!(ppu.fine_x, 3);
+            assert_eq!(ppu.t, 0x0C02);
+            assert!(ppu.write_latch);
+            assert_eq!(ppu.v, 0x1234);
+
+            ppu.cpu_write(0x2005, 43, &mut cart).unwrap();
+            assert_eq!(ppu.t, 0x3CA2);
+            assert!(!ppu.write_latch);
+            assert_eq!(ppu.v, 0x1234);
+
+            // 再写零，必须清除旧滚动位，但保留名称表位。
+            ppu.cpu_write(0x2005, 0, &mut cart).unwrap();
+            ppu.cpu_write(0x2005, 0, &mut cart).unwrap();
+
+            assert_eq!(ppu.t, 0x0C00);
+            assert_eq!(ppu.fine_x, 0);
+            assert_eq!(ppu.v, 0x1234);
+        }
+
+        #[test]
+        fn scroll_and_address_share_the_write_latch() {
+            let mut ppu = Ppu::new();
+            let mut cart = cartridge();
+
+            // 第一次写 2005，使下一次成为“第二次写”。
+            ppu.cpu_write(0x2005, 19, &mut cart).unwrap();
+
+            // 因为共用 latch，这次是 2006 的低字节写入。
+            ppu.cpu_write(0x2006, 0x34, &mut cart).unwrap();
+
+            assert_eq!(ppu.t, 0x0034);
+            assert_eq!(ppu.v, 0x0034);
+            assert_eq!(ppu.fine_x, 3);
+            assert!(!ppu.write_latch);
+
+            ppu.cpu_write(0x2005, 7, &mut cart).unwrap();
+            assert!(ppu.write_latch);
+
+            // 读状态寄存器，把下一次写重置为第一次。
+            ppu.cpu_read(0x2002, &cart).unwrap();
+            assert!(!ppu.write_latch);
+
+            ppu.cpu_write(0x2005, 8, &mut cart).unwrap();
+            assert_eq!(ppu.t & 0x001F, 1);
+            assert_eq!(ppu.fine_x, 0);
+            assert!(ppu.write_latch);
+        }
+
+        #[test]
+        fn horizontal_increment_wraps_and_preserves_other_fields() {
+            for (before, expected) in [
+                (0x0000u16, 0x0001u16),
+                (0x001E, 0x001F),
+                (0x001F, 0x0400),
+                (0x041F, 0x0000),
+                (0x7BFE, 0x7BFF),
+                (0x7BFF, 0x7FE0),
+            ] {
+                let mut ppu = Ppu::new();
+                ppu.v = before;
+                ppu.t = 0x1234;
+                ppu.fine_x = 5;
+
+                ppu.increment_scroll_x();
+
+                assert_eq!(ppu.v, expected, "before={before:04X}");
+                assert_eq!(ppu.t, 0x1234);
+                assert_eq!(ppu.fine_x, 5);
+            }
+        }
+
+        #[test]
+        fn vertical_increment_handles_fine_y_and_special_rows() {
+            for (before, expected) in [
+                (0x0000u16, 0x1000u16), // fine Y: 0 → 1
+                (0x6000, 0x7000),       // fine Y: 6 → 7
+                (0x7000, 0x0020),       // coarse Y: 0 → 1
+                (0x73A0, 0x0800),       // coarse Y: 29 → 0，切换表
+                (0x7BA0, 0x0000),       // 同上，切回原表
+                (0x73C0, 0x03E0),       // coarse Y: 30 → 31
+                (0x73E0, 0x0000),       // coarse Y: 31 → 0，不切表
+                (0x7BE0, 0x0800),       // 保留原纵向表位
+            ] {
+                let mut ppu = Ppu::new();
+
+                // 同时设置横向字段，检查它们不被误改。
+                ppu.v = before | 0x0415;
+                ppu.t = 0x1234;
+                ppu.fine_x = 6;
+
+                ppu.increment_scroll_y();
+
+                assert_eq!(ppu.v, expected | 0x0415, "before={before:04X}");
+                assert_eq!(ppu.t, 0x1234);
+                assert_eq!(ppu.fine_x, 6);
+            }
+        }
+
+        #[test]
+        fn scroll_copies_replace_only_the_selected_fields() {
+            let mut ppu = Ppu::new();
+            ppu.fine_x = 5;
+
+            ppu.v = 0x7FFF;
+            ppu.t = 0;
+            ppu.copy_scroll_x();
+            assert_eq!(ppu.v, 0x7BE0);
+
+            ppu.t = 0x041F;
+            ppu.copy_scroll_x();
+            assert_eq!(ppu.v, 0x7FFF);
+            assert_eq!(ppu.t, 0x041F);
+
+            ppu.t = 0;
+            ppu.copy_scroll_y();
+            assert_eq!(ppu.v, 0x041F);
+
+            ppu.t = 0x7BE0;
+            ppu.copy_scroll_y();
+            assert_eq!(ppu.v, 0x7FFF);
+            assert_eq!(ppu.t, 0x7BE0);
+            assert_eq!(ppu.fine_x, 5);
+        }
     }
 }
