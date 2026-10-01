@@ -58,6 +58,20 @@ pub struct Ppu {
     io_latch: u8,    // 最近一次寄存器接口的数据值，简化模拟 open bus
 
     fine_x: u8,
+
+    // 正在取得的下一个图块数据。
+    next_tile_id: u8,
+    next_tile_palette: u8, // 已选出象限的子调色板编号：0～3
+    next_tile_pattern_low: u8,
+    next_tile_pattern_high: u8,
+
+    // 图案移位寄存器。
+    bg_pattern_low: u16,
+    bg_pattern_high: u16,
+
+    // 子调色板编号的两个位平面。
+    bg_attribute_low: u16,
+    bg_attribute_high: u16,
 }
 
 impl Ppu {
@@ -76,6 +90,14 @@ impl Ppu {
             read_buffer: 0,
             io_latch: 0,
             fine_x: 0,
+            next_tile_id: 0,
+            next_tile_palette: 0,
+            next_tile_pattern_low: 0,
+            next_tile_pattern_high: 0,
+            bg_pattern_low: 0,
+            bg_pattern_high: 0,
+            bg_attribute_low: 0u16,
+            bg_attribute_high: 0u16,
         }
     }
 
@@ -301,6 +323,114 @@ impl Ppu {
 
     fn copy_scroll_y(&mut self) {
         self.v = (self.v & !SCROLL_Y_MASK) | (self.t & SCROLL_Y_MASK);
+    }
+
+    fn fetch_bg_tile_id(&mut self, cartridge: &Cartridge) -> Result<(), String> {
+        let addr = 0x2000 | (self.v & 0x0FFF);
+        self.next_tile_id = self.read(addr, cartridge)?;
+        Ok(())
+    }
+
+    fn fetch_bg_attribute(&mut self, cartridge: &Cartridge) -> Result<(), String> {
+        let attribute_addr =
+            0x23C0 | (self.v & 0x0C00) | ((self.v >> 4) & 0x0038) | ((self.v >> 2) & 0x0007);
+        let attribute = self.read(attribute_addr, cartridge)?;
+        let tile_x = self.v & 0x001F;
+        let tile_y = (self.v >> 5) & 0x001F;
+        let right = tile_x % 4 >= 2;
+        let bottom = tile_y % 4 >= 2;
+
+        let shift = match (bottom, right) {
+            (false, false) => 0,
+            (false, true) => 2,
+            (true, false) => 4,
+            (true, true) => 6,
+        };
+        let palette_id = (attribute >> shift) & 0x03;
+
+        self.next_tile_palette = palette_id;
+        Ok(())
+    }
+
+    fn fetch_bg_pattern_low(&mut self, cartridge: &Cartridge) -> Result<(), String> {
+        let pattern_base: u16 = if self.ctrl & 0x10 != 0 {
+            0x1000
+        } else {
+            0x0000
+        };
+
+        let fine_y = (self.v >> 12) & 0x07;
+
+        let addr = pattern_base + u16::from(self.next_tile_id) * 16 + fine_y;
+        self.next_tile_pattern_low = self.read(addr, cartridge)?;
+        Ok(())
+    }
+
+    fn fetch_bg_pattern_high(&mut self, cartridge: &Cartridge) -> Result<(), String> {
+        let pattern_base: u16 = if self.ctrl & 0x10 != 0 {
+            0x1000
+        } else {
+            0x0000
+        };
+
+        let fine_y = (self.v >> 12) & 0x07;
+
+        let addr = pattern_base + u16::from(self.next_tile_id) * 16 + fine_y + 8;
+        self.next_tile_pattern_high = self.read(addr, cartridge)?;
+        Ok(())
+    }
+
+    // 返回：(图块像素编号 0～3，子调色板编号 0～3)
+    fn background_pixel(&self) -> (u8, u8) {
+        let mask = 0x8000_u16 >> self.fine_x;
+
+        // 两个位平面分别提供像素编号的 bit 0 和 bit 1。
+        let pixel_low = u8::from(self.bg_pattern_low & mask != 0);
+        let pixel_high = u8::from(self.bg_pattern_high & mask != 0);
+
+        // 配色同样随像素移动，取相同位置的两位。
+        let palette_low = u8::from(self.bg_attribute_low & mask != 0);
+        let palette_high = u8::from(self.bg_attribute_high & mask != 0);
+
+        let pixel = (pixel_high << 1) | pixel_low;
+        let palette = (palette_high << 1) | palette_low;
+
+        (pixel, palette)
+    }
+
+    fn load_background_shifters(&mut self) {
+        // 保留高 8 位，将取得的新图块行装入低 8 位。
+        self.bg_pattern_low =
+            (self.bg_pattern_low & 0xFF00) | u16::from(self.next_tile_pattern_low);
+
+        self.bg_pattern_high =
+            (self.bg_pattern_high & 0xFF00) | u16::from(self.next_tile_pattern_high);
+
+        // 同一图块的八个像素使用同一个子调色板。
+        // 把子调色板编号的每一位扩展成八个相同的位。
+        let attribute_low: u16 = if self.next_tile_palette & 0x01 != 0 {
+            0xFF
+        } else {
+            0
+        };
+
+        let attribute_high: u16 = if self.next_tile_palette & 0x02 != 0 {
+            0xFF
+        } else {
+            0
+        };
+
+        self.bg_attribute_low = (self.bg_attribute_low & 0xFF00) | attribute_low;
+
+        self.bg_attribute_high = (self.bg_attribute_high & 0xFF00) | attribute_high;
+    }
+
+    fn shift_background(&mut self) {
+        // 图案和配色一起移动，保持像素与子调色板对应。
+        self.bg_pattern_low <<= 1;
+        self.bg_pattern_high <<= 1;
+        self.bg_attribute_low <<= 1;
+        self.bg_attribute_high <<= 1;
     }
 }
 
@@ -827,6 +957,174 @@ mod tests {
             assert_eq!(ppu.v, 0x7FFF);
             assert_eq!(ppu.t, 0x7BE0);
             assert_eq!(ppu.fine_x, 5);
+        }
+    }
+
+    #[cfg(test)]
+    mod background_pipeline_tests {
+        use super::*;
+
+        fn cartridge() -> Cartridge {
+            let mut bytes = vec![0u8; 16 + 16 * 1024];
+            bytes[..4].copy_from_slice(b"NES\x1A");
+            bytes[4] = 1;
+            bytes[6] = 1; // 垂直镜像，CHR RAM
+            Cartridge::try_from(bytes.as_slice()).unwrap()
+        }
+
+        #[test]
+        fn fetches_tile_attribute_and_pattern_from_v() {
+            let mut ppu = Ppu::new();
+            let mut cart = cartridge();
+
+            // 名称表 2400，coarse X=10，coarse Y=6，fine Y=3。
+            ppu.v = 0x3000 | 0x0400 | (6 << 5) | 10;
+            ppu.t = 0x1234;
+            ppu.fine_x = 5;
+            ppu.read_buffer = 0xA7;
+            ppu.write_latch = true;
+            ppu.ctrl = 0x10; // 背景使用图案表 1000。
+
+            ppu.write(0x24CA, 5, &mut cart).unwrap();
+            ppu.write(0x27CA, 0xE4, &mut cart).unwrap();
+
+            cart.ppu_write(0x1053, 0x96).unwrap();
+            cart.ppu_write(0x105B, 0x69).unwrap();
+
+            let old_v = ppu.v;
+
+            ppu.fetch_bg_tile_id(&cart).unwrap();
+            ppu.fetch_bg_attribute(&cart).unwrap();
+            ppu.fetch_bg_pattern_low(&cart).unwrap();
+            ppu.fetch_bg_pattern_high(&cart).unwrap();
+
+            assert_eq!(ppu.next_tile_id, 5);
+            assert_eq!(ppu.next_tile_palette, 3); // 右下象限
+            assert_eq!(ppu.next_tile_pattern_low, 0x96);
+            assert_eq!(ppu.next_tile_pattern_high, 0x69);
+
+            assert_eq!(ppu.v, old_v);
+            assert_eq!(ppu.t, 0x1234);
+            assert_eq!(ppu.fine_x, 5);
+            assert_eq!(ppu.read_buffer, 0xA7);
+            assert!(ppu.write_latch);
+
+            // 改用图案表 0000，仍读取图块 5 的第 3 行。
+            cart.ppu_write(0x0053, 0x12).unwrap();
+            cart.ppu_write(0x005B, 0x34).unwrap();
+            ppu.ctrl = 0;
+
+            ppu.fetch_bg_pattern_low(&cart).unwrap();
+            ppu.fetch_bg_pattern_high(&cart).unwrap();
+
+            assert_eq!(ppu.next_tile_pattern_low, 0x12);
+            assert_eq!(ppu.next_tile_pattern_high, 0x34);
+        }
+
+        #[test]
+        fn fetches_all_four_attribute_quadrants() {
+            let mut ppu = Ppu::new();
+            let mut cart = cartridge();
+            ppu.write(0x23C0, 0xE4, &mut cart).unwrap();
+
+            for (x, y, expected) in [(0u16, 0u16, 0u8), (2, 0, 1), (0, 2, 2), (2, 2, 3)] {
+                ppu.v = (y << 5) | x;
+                ppu.fetch_bg_attribute(&cart).unwrap();
+                assert_eq!(ppu.next_tile_palette, expected);
+            }
+        }
+
+        #[test]
+        fn loading_preserves_high_bytes_and_replaces_low_bytes() {
+            let mut ppu = Ppu::new();
+
+            for palette in 0..4u8 {
+                ppu.bg_pattern_low = 0xAB12;
+                ppu.bg_pattern_high = 0xCD34;
+                ppu.bg_attribute_low = 0x55AA;
+                ppu.bg_attribute_high = 0x66AA;
+
+                ppu.next_tile_pattern_low = 0x96;
+                ppu.next_tile_pattern_high = 0x69;
+                ppu.next_tile_palette = palette;
+
+                ppu.load_background_shifters();
+
+                assert_eq!(ppu.bg_pattern_low, 0xAB96);
+                assert_eq!(ppu.bg_pattern_high, 0xCD69);
+
+                let low: u16 = if palette & 1 != 0 { 0xFF } else { 0 };
+                let high: u16 = if palette & 2 != 0 { 0xFF } else { 0 };
+
+                assert_eq!(ppu.bg_attribute_low, 0x5500 | low);
+                assert_eq!(ppu.bg_attribute_high, 0x6600 | high);
+            }
+        }
+
+        fn two_tiles() -> Ppu {
+            let mut ppu = Ppu::new();
+
+            // 第一个图块行：0,1,2,3,0,1,2,3，子调色板 1。
+            ppu.next_tile_pattern_low = 0x55;
+            ppu.next_tile_pattern_high = 0x33;
+            ppu.next_tile_palette = 1;
+            ppu.load_background_shifters();
+
+            // 将第一个图块移到高字节。
+            for _ in 0..8 {
+                ppu.shift_background();
+            }
+
+            // 第二个图块行：3,2,1,0,3,2,1,0，子调色板 2。
+            ppu.next_tile_pattern_low = 0xAA;
+            ppu.next_tile_pattern_high = 0xCC;
+            ppu.next_tile_palette = 2;
+            ppu.load_background_shifters();
+
+            ppu
+        }
+
+        #[test]
+        fn outputs_two_tiles_with_matching_palettes() {
+            let mut ppu = two_tiles();
+
+            let expected = [0, 1, 2, 3, 0, 1, 2, 3, 3, 2, 1, 0, 3, 2, 1, 0];
+
+            for (i, pixel) in expected.into_iter().enumerate() {
+                let palette = if i < 8 { 1 } else { 2 };
+                assert_eq!(ppu.background_pixel(), (pixel, palette));
+
+                // 本测试约定先取像素，再移位。
+                ppu.shift_background();
+            }
+        }
+
+        #[test]
+        fn fine_x_selects_pixels_across_a_tile_boundary() {
+            let mut ppu = two_tiles();
+            ppu.fine_x = 3;
+
+            let expected = [
+                (3, 1),
+                (0, 1),
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (3, 2),
+                (2, 2),
+                (1, 2),
+            ];
+
+            for pair in expected {
+                assert_eq!(ppu.background_pixel(), pair);
+
+                // 读取本身不移动寄存器。
+                assert_eq!(ppu.background_pixel(), pair);
+
+                ppu.shift_background();
+            }
+
+            assert_eq!(ppu.fine_x, 3);
         }
     }
 }
