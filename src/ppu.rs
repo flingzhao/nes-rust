@@ -1,4 +1,7 @@
+use sdl2::pixels;
+
 use crate::cartridge::{Cartridge, Mirroring};
+use crate::debug_video::decode_tile_row;
 
 const COARSE_X_MASK: u16 = 0x001F;
 const COARSE_Y_MASK: u16 = 0x03E0;
@@ -38,6 +41,15 @@ fn palette_index(addr: u16) -> usize {
         0x10 | 0x14 | 0x18 | 0x1C => index - 0x10,
         _ => index,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpriteRow {
+    oam_index: u8,
+    x: u8,
+    palette: u8,
+    behind_background: bool,
+    pixels: [u8; 8],
 }
 
 pub struct Ppu {
@@ -559,6 +571,100 @@ impl Ppu {
 
     pub fn oam(&self) -> &[u8; 256] {
         &self.oam
+    }
+
+    // row 是已经处理过上下翻转的行号：
+    // 8×8 时为 0～7，8×16 时为 0～15。
+    fn sprite_pattern_address(&self, tile_id: u8, row: u8) -> u16 {
+        let sprite_mode8x8 = self.ctrl & 0x20 == 0;
+        let addr = match sprite_mode8x8 {
+            true => {
+                let table_base = if self.ctrl & 0x08 == 0 {
+                    0x0000_u16
+                } else {
+                    0x1000_u16
+                };
+
+                table_base + u16::from(tile_id) * 16_u16 + u16::from(row)
+            }
+            false => {
+                let table_base = u16::from(tile_id & 0x01) * 0x1000;
+                let top_tile = u16::from(tile_id & 0xFE);
+                let actual_tile = top_tile + u16::from(row) / 8;
+
+                table_base + actual_tile * 16 + u16::from(row) % 8
+            }
+        };
+
+        addr
+    }
+
+    // scanline 明确表示“需要准备像素的目标扫描线”。
+    fn collect_sprite_rows(
+        &self,
+        scanline: u16,
+        cartridge: &Cartridge,
+    ) -> Result<Vec<SpriteRow>, String> {
+        if scanline >= 240 {
+            return Ok(Vec::<SpriteRow>::new());
+        }
+
+        let height: u16 = if self.ctrl & 0x20 != 0 { 16 } else { 8 };
+        let mut sprites = Vec::new();
+
+        for index in 0..64 {
+            let oam_y = self.oam[index * 4usize];
+            let oma_index = self.oam[index * 4usize + 1];
+            let attr = self.oam[index * 4usize + 2];
+            let oam_x = self.oam[index * 4usize + 3];
+
+            let flipy = attr & 0x80 != 0;
+            let flipx = attr & 0x40 != 0;
+            let behind_background = attr & 0x20 != 0;
+            let palette = attr & 0x03;
+
+            // Y坐标有一行偏移
+            let top = u16::from(oam_y) + 1;
+            // 先判断目标扫描线是否落在精灵范围内。
+            if scanline < top || scanline >= top + height {
+                continue;
+            }
+
+            let screen_row = scanline - top;
+
+            let pattern_row = if attr & 0x80 != 0 {
+                height - 1 - screen_row
+            } else {
+                screen_row
+            };
+
+            let low_addr = self.sprite_pattern_address(oma_index, pattern_row as u8);
+            let high_addr = low_addr + 8;
+
+            let low = self.read(low_addr, cartridge)?;
+            let high = self.read(high_addr, cartridge)?;
+
+            let mut pixels = decode_tile_row(low, high);
+
+            let mut pixels = decode_tile_row(low, high);
+
+            if flipx {
+                pixels.reverse();
+            }
+            sprites.push(SpriteRow {
+                oam_index: index as u8,
+                x: oam_x,
+                palette: palette,
+                behind_background: behind_background,
+                pixels: pixels,
+            });
+
+            if sprites.len() == 8 {
+                break;
+            }
+        }
+
+        Ok(sprites)
     }
 }
 
@@ -1464,6 +1570,180 @@ mod tests {
             ppu.dot = 2;
 
             assert!(ppu.clock(None).is_err());
+        }
+    }
+
+    #[cfg(test)]
+    mod sprite_row_tests {
+        use super::*;
+
+        fn fixture() -> (Ppu, Cartridge) {
+            // Mapper 0，16 KiB PRG，8 KiB CHR RAM。
+            let mut rom = vec![0u8; 16 + 16 * 1024];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+
+            let cartridge = Cartridge::try_from(rom.as_slice()).unwrap();
+
+            let mut ppu = Ppu::new();
+            // 隐藏所有未显式设置的精灵。
+            ppu.oam.fill(0xFF);
+
+            (ppu, cartridge)
+        }
+
+        fn set_sprite(ppu: &mut Ppu, index: usize, y: u8, tile: u8, attributes: u8, x: u8) {
+            let start = index * 4;
+            ppu.oam[start..start + 4].copy_from_slice(&[y, tile, attributes, x]);
+        }
+
+        fn write_row(cartridge: &mut Cartridge, address: u16, low: u8, high: u8) {
+            cartridge.ppu_write(address, low).unwrap();
+            cartridge.ppu_write(address + 8, high).unwrap();
+        }
+
+        #[test]
+        fn sprite_pattern_addresses_cover_both_sizes_and_tables() {
+            let (mut ppu, _) = fixture();
+
+            // ctrl、tile_id、处理过翻转的 row、预期低位平面地址。
+            let cases: [(u8, u8, u8, u16); 8] = [
+                (0x00, 3, 2, 0x0032),
+                (0x08, 3, 2, 0x1032),
+                (0x20, 5, 0, 0x1040),
+                (0x20, 5, 7, 0x1047),
+                (0x20, 5, 8, 0x1050),
+                (0x20, 5, 15, 0x1057),
+                (0x20, 4, 0, 0x0040),
+                // 8×16 模式忽略 ctrl bit 3。
+                (0x28, 4, 0, 0x0040),
+            ];
+
+            for (ctrl, tile, row, expected) in cases {
+                ppu.ctrl = ctrl;
+                assert_eq!(
+                    ppu.sprite_pattern_address(tile, row),
+                    expected,
+                    "ctrl={ctrl:#04X}, tile={tile}, row={row}"
+                );
+            }
+        }
+
+        #[test]
+        fn selection_uses_y_plus_one_without_wrapping() {
+            let (mut ppu, cartridge) = fixture();
+            set_sprite(&mut ppu, 0, 20, 0, 0, 10);
+
+            assert!(ppu.collect_sprite_rows(20, &cartridge).unwrap().is_empty());
+
+            for scanline in 21..=28 {
+                let rows = ppu.collect_sprite_rows(scanline, &cartridge).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].oam_index, 0);
+            }
+
+            assert!(ppu.collect_sprite_rows(29, &cartridge).unwrap().is_empty());
+
+            // Y=$FF 不能回绕后出现在第 0 行。
+            ppu.oam.fill(0xFF);
+            assert!(ppu.collect_sprite_rows(0, &cartridge).unwrap().is_empty());
+
+            // 非可见扫描线不准备输出。
+            set_sprite(&mut ppu, 0, 239, 0, 0, 0);
+            assert!(ppu.collect_sprite_rows(240, &cartridge).unwrap().is_empty());
+        }
+
+        #[test]
+        fn first_eight_in_oam_order_win_even_when_transparent() {
+            let (mut ppu, mut cartridge) = fixture();
+
+            // Tile 0 全透明；tile 1 的首行全部为像素 1。
+            write_row(&mut cartridge, 0x0010, 0xFF, 0);
+
+            // OAM 0 隐藏。OAM 1～9 都覆盖扫描线 1。
+            for index in 1..=9 {
+                let tile = if index == 9 { 1 } else { 0 };
+                set_sprite(&mut ppu, index, 0, tile, 0, 255);
+            }
+
+            let rows = ppu.collect_sprite_rows(1, &cartridge).unwrap();
+
+            assert_eq!(rows.len(), 8);
+            let indices: Vec<u8> = rows.iter().map(|row| row.oam_index).collect();
+            assert_eq!(indices, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+            assert!(rows.iter().all(|row| row.pixels == [0; 8]));
+            assert!(rows.iter().all(|row| row.x == 255));
+        }
+
+        #[test]
+        fn eight_by_eight_pixels_and_all_flip_combinations() {
+            let (mut ppu, mut cartridge) = fixture();
+            ppu.ctrl = 0x08; // 精灵图案表 $1000。
+
+            // Tile 3 第 0 行：1,2,0,0,0,0,0,0。
+            write_row(&mut cartridge, 0x1030, 0x80, 0x40);
+            // Tile 3 第 7 行：0,0,0,0,0,0,2,1。
+            write_row(&mut cartridge, 0x1037, 0x01, 0x02);
+
+            let cases: [(u8, [u8; 8]); 4] = [
+                (0x00, [1, 2, 0, 0, 0, 0, 0, 0]),
+                (0x40, [0, 0, 0, 0, 0, 0, 2, 1]),
+                (0x80, [0, 0, 0, 0, 0, 0, 2, 1]),
+                (0xC0, [1, 2, 0, 0, 0, 0, 0, 0]),
+            ];
+
+            for (flip, expected) in cases {
+                // $23：子调色板 3，位于背景后方。
+                set_sprite(&mut ppu, 0, 0, 3, 0x23 | flip, 37);
+
+                let rows = ppu.collect_sprite_rows(1, &cartridge).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].pixels, expected, "flip={flip:#04X}");
+                assert_eq!(rows[0].palette, 3);
+                assert!(rows[0].behind_background);
+                assert_eq!(rows[0].x, 37);
+                assert_eq!(rows[0].oam_index, 0);
+            }
+
+            set_sprite(&mut ppu, 0, 0, 3, 0, 37);
+            let rows = ppu.collect_sprite_rows(1, &cartridge).unwrap();
+            assert!(!rows[0].behind_background);
+        }
+
+        #[test]
+        fn eight_by_sixteen_vertical_flip_swaps_the_two_tiles() {
+            let (mut ppu, mut cartridge) = fixture();
+            ppu.ctrl = 0x20;
+
+            // tile_id=5：表 $1000，上半图块 4，下半图块 5。
+            write_row(&mut cartridge, 0x1040, 0xFF, 0); // 行 0：1
+            write_row(&mut cartridge, 0x1047, 0, 0xFF); // 行 7：2
+            write_row(&mut cartridge, 0x1050, 0xFF, 0xFF); // 行 8：3
+            write_row(&mut cartridge, 0x1057, 0, 0); // 行15：0
+
+            let cases: [(u8, u16, u8); 8] = [
+                (0x00, 1, 1),
+                (0x00, 8, 2),
+                (0x00, 9, 3),
+                (0x00, 16, 0),
+                (0x80, 1, 0),
+                (0x80, 8, 3),
+                (0x80, 9, 2),
+                (0x80, 16, 1),
+            ];
+
+            for (attributes, scanline, pixel) in cases {
+                set_sprite(&mut ppu, 0, 0, 5, attributes, 0);
+                let rows = ppu.collect_sprite_rows(scanline, &cartridge).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].pixels, [pixel; 8],
+                    "attributes={attributes:#04X}, scanline={scanline}"
+                );
+            }
+
+            assert!(ppu.collect_sprite_rows(17, &cartridge).unwrap().is_empty());
         }
     }
 }
