@@ -19,7 +19,7 @@ impl Nes {
         self.cpu.set_nmi_line(self.bus.ppu().nmi_line());
         let cycle = self.cpu.step(&mut self.bus)?;
         for _ in 0..cycle {
-            for asserted in self.bus.clock_cpu_cycle() {
+            for asserted in self.bus.clock_cpu_cycle()? {
                 self.cpu.set_nmi_line(asserted);
             }
         }

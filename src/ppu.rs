@@ -72,6 +72,8 @@ pub struct Ppu {
     // 子调色板编号的两个位平面。
     bg_attribute_low: u16,
     bg_attribute_high: u16,
+    mask: u8,
+    framebuffer: Vec<u8>,
 }
 
 impl Ppu {
@@ -98,11 +100,13 @@ impl Ppu {
             bg_pattern_high: 0,
             bg_attribute_low: 0u16,
             bg_attribute_high: 0u16,
+            mask: 0,
+            framebuffer: vec![0; 256 * 240],
         }
     }
 
-    /// 推进一个 PPU 周期。
-    pub fn clock(&mut self) {
+    #[cfg(test)]
+    pub fn clock_test(&mut self) {
         if self.dot == 1 && self.scanline == 241 {
             self.status = self.status | 0x80;
         }
@@ -123,6 +127,102 @@ impl Ppu {
         }
     }
 
+    /// 推进一个 PPU 周期。
+    pub fn clock(&mut self, cartridge: Option<&Cartridge>) -> Result<(), String> {
+        if self.dot == 1 && self.scanline == 241 {
+            self.status = self.status | 0x80;
+        }
+
+        if self.dot == 1 && self.scanline == 261 {
+            self.status = self.status & 0x1F;
+        }
+
+        // render background
+        if self.scanline <= 239 && self.dot >= 1 && self.dot <= 256 {
+            let (mut pixel, palette) = self.background_pixel();
+            let x = usize::from(self.dot - 1);
+            let y = usize::from(self.scanline);
+
+            if self.mask & 0x08 == 0 || (x < 8 && self.mask & 0x02 == 0) {
+                pixel = 0;
+            }
+
+            let addr = if pixel == 0 {
+                0x3F00
+            } else {
+                0x3F00 + u16::from(palette) * 4 + u16::from(pixel)
+            };
+            let color_mask = if self.mask & 0x01 != 0 { 0x30 } else { 0x3F };
+            let color = self.palette_ram[palette_index(addr)];
+
+            self.framebuffer[y * 256 + x] = color & color_mask;
+        }
+
+        let render_line = self.scanline < 240 || self.scanline == 261;
+        let rendering_enabled = self.mask & 0x18 != 0;
+
+        if render_line && rendering_enabled {
+            let fetch_window = (1..=256).contains(&self.dot) || (321..=336).contains(&self.dot);
+
+            if fetch_window {
+                let cartridge =
+                    cartridge.ok_or_else(|| "No cartridge for PPU rendering".to_string())?;
+
+                self.shift_background();
+
+                match self.dot % 8 {
+                    2 => {
+                        // 读取图块编号。
+                        self.fetch_bg_tile_id(cartridge)?;
+                    }
+                    4 => {
+                        // 读取属性。
+                        self.fetch_bg_attribute(cartridge)?;
+                    }
+                    6 => {
+                        // 读取图案低位平面。
+                        self.fetch_bg_pattern_low(cartridge)?;
+                    }
+                    0 => {
+                        // 读取高位平面。
+                        self.fetch_bg_pattern_high(cartridge)?;
+                        // 装载移位寄存器。
+                        // 横向地址递增。
+                        self.load_background_shifters();
+                        // self.shift_background();
+                        self.increment_scroll_x();
+                    }
+                    _ => {}
+                }
+            }
+
+            // 分别判断纵向递增、横向复制、纵向复制。
+            if self.dot == 256 {
+                self.increment_scroll_y();
+            }
+
+            if self.dot == 257 {
+                self.copy_scroll_x();
+            }
+
+            if self.scanline == 261 && (280..=304).contains(&self.dot) {
+                self.copy_scroll_y();
+            }
+        }
+
+        self.dot += 1;
+        if self.dot == 341_u16 {
+            self.dot = 0;
+            self.scanline += 1;
+        }
+
+        if self.scanline == 262 {
+            self.scanline = 0;
+            self.frame += 1;
+        }
+        Ok(())
+    }
+
     pub fn dot(&self) -> u16 {
         self.dot
     }
@@ -133,6 +233,10 @@ impl Ppu {
 
     pub fn frame(&self) -> u64 {
         self.frame
+    }
+
+    pub fn framebuffer(&self) -> &[u8] {
+        &self.framebuffer
     }
 
     pub fn nmi_line(&self) -> bool {
@@ -240,6 +344,9 @@ impl Ppu {
                 // 控制寄存器的nametable_x(bit 0)写入 t寄存器的nametable_x(bit 10)
                 // 控制寄存器的nametable_y(bit 1)写入 t寄存器的nametable_y(bit 11)
                 self.t = (self.t & !0x0C00) | (u16::from(value & 0x03) << 10);
+            }
+            0x0001 => {
+                self.mask = value;
             }
             0x0002 => {}
             0x0005 => {
@@ -443,14 +550,14 @@ mod tests {
         let mut ppu = Ppu::new();
 
         for _ in 0..340 {
-            ppu.clock();
+            ppu.clock_test();
         }
 
         assert_eq!(ppu.dot(), 340);
         assert_eq!(ppu.scanline(), 0);
         assert_eq!(ppu.frame(), 0);
 
-        ppu.clock();
+        ppu.clock_test();
 
         assert_eq!(ppu.dot(), 0);
         assert_eq!(ppu.scanline(), 1);
@@ -462,14 +569,14 @@ mod tests {
         let mut ppu = Ppu::new();
 
         for _ in 0..(341 * 262 - 1) {
-            ppu.clock();
+            ppu.clock_test();
         }
 
         assert_eq!(ppu.dot(), 340);
         assert_eq!(ppu.scanline(), 261);
         assert_eq!(ppu.frame(), 0);
 
-        ppu.clock();
+        ppu.clock_test();
 
         assert_eq!(ppu.dot(), 0);
         assert_eq!(ppu.scanline(), 0);
@@ -477,7 +584,7 @@ mod tests {
 
         // 未开启渲染，第二帧同样是完整的 89342 个周期。
         for _ in 0..(341 * 262) {
-            ppu.clock();
+            ppu.clock_test();
         }
 
         assert_eq!(ppu.dot(), 0);
@@ -485,7 +592,7 @@ mod tests {
         assert_eq!(ppu.frame(), 2);
     }
 
-    use crate::cartridge::Cartridge;
+    use crate::cartridge::{self, Cartridge};
 
     fn ppu_test_cartridge(vertical: bool, chr_rom: bool) -> Cartridge {
         let chr_size = if chr_rom { 8192 } else { 0 };
@@ -746,13 +853,13 @@ mod tests {
 
         // 到达待处理位置 (241, 1)，尚未处理该 tick。
         for _ in 0..(241 * 341 + 1) {
-            ppu.clock();
+            ppu.clock_test();
         }
 
         assert_eq!((ppu.scanline(), ppu.dot()), (241, 1));
         assert_eq!(ppu.status & 0x80, 0);
 
-        ppu.clock();
+        ppu.clock_test();
 
         assert_eq!((ppu.scanline(), ppu.dot()), (241, 2));
         assert_ne!(ppu.status & 0x80, 0);
@@ -766,14 +873,14 @@ mod tests {
         let mut ppu = Ppu::new();
 
         for _ in 0..(261 * 341 + 1) {
-            ppu.clock();
+            ppu.clock_test();
         }
 
         assert_eq!((ppu.scanline(), ppu.dot()), (261, 1));
 
         // 同时验证 Sprite 0 Hit / Overflow 的清除。
         ppu.status |= 0xE0;
-        ppu.clock();
+        ppu.clock_test();
 
         assert_eq!(ppu.status & 0xE0, 0);
         assert!(!ppu.nmi_line());
@@ -789,7 +896,7 @@ mod tests {
         assert!(!ppu.nmi_line());
 
         for _ in 0..(241 * 341 + 2) {
-            ppu.clock();
+            ppu.clock_test();
         }
         assert!(ppu.nmi_line());
 
@@ -809,7 +916,7 @@ mod tests {
 
         // 读取之后继续推进，不应在同一 VBlank 内自动重新置位。
         for _ in 0..20 {
-            ppu.clock();
+            ppu.clock_test();
         }
         assert_eq!(ppu.status & 0x80, 0);
     }
@@ -1125,6 +1232,217 @@ mod tests {
             }
 
             assert_eq!(ppu.fine_x, 3);
+        }
+    }
+
+    #[cfg(test)]
+    mod clocked_background_tests {
+        use super::*;
+
+        fn fixture(mask: u8, scroll_x: u8) -> (Ppu, Cartridge) {
+            let mut bytes = vec![0u8; 16 + 16 * 1024];
+            bytes[..4].copy_from_slice(b"NES\x1A");
+            bytes[4] = 1;
+            bytes[6] = 1; // 垂直镜像，两个横向页面独立。
+
+            let mut cart = Cartridge::try_from(bytes.as_slice()).unwrap();
+            let mut ppu = Ppu::new();
+
+            for row in 0..8u16 {
+                // 图块 1：每行、每列都有变化。
+                let low = if row & 1 == 0 { 0x55 } else { 0xAA };
+                let high = if row < 4 { 0x33 } else { 0xCC };
+
+                cart.ppu_write(0x10 + row, low).unwrap();
+                cart.ppu_write(0x18 + row, high).unwrap();
+
+                // 图块 2：全部像素编号为 1。
+                cart.ppu_write(0x20 + row, 0xFF).unwrap();
+                cart.ppu_write(0x28 + row, 0).unwrap();
+            }
+
+            for page in 0..2u16 {
+                let base = 0x2000 + page * 0x400;
+
+                for ty in 0..30u16 {
+                    for tx in 0..32u16 {
+                        let tile = ((tx + ty + page) % 2 + 1) as u8;
+                        ppu.write(base + ty * 32 + tx, tile, &mut cart).unwrap();
+                    }
+                }
+
+                let attribute = if page == 0 { 0xE4 } else { 0x1B };
+                for offset in 0..64u16 {
+                    ppu.write(base + 0x3C0 + offset, attribute, &mut cart)
+                        .unwrap();
+                }
+            }
+
+            ppu.write(0x3F00, 0x0F, &mut cart).unwrap();
+            for offset in 1..16u16 {
+                ppu.write(0x3F00 + offset, 0x20 + offset as u8, &mut cart)
+                    .unwrap();
+            }
+
+            ppu.cpu_write(0x2000, 0, &mut cart).unwrap();
+            ppu.cpu_write(0x2005, scroll_x, &mut cart).unwrap();
+            ppu.cpu_write(0x2005, 0, &mut cart).unwrap();
+            ppu.cpu_write(0x2001, mask, &mut cart).unwrap();
+
+            // 测试先经过预渲染，再绘制第一张完整背景。
+            ppu.scanline = 261;
+            ppu.dot = 0;
+
+            (ppu, cart)
+        }
+
+        fn render_frame(ppu: &mut Ppu, cart: &Cartridge) {
+            // 预渲染行 + 240 条可见行。
+            for _ in 0..341 * 241 {
+                ppu.clock(Some(cart)).unwrap();
+            }
+
+            assert_eq!(ppu.scanline, 240);
+            assert_eq!(ppu.dot, 0);
+        }
+
+        fn expected_pixel(x: usize, y: usize, scroll_x: u8, mask: u8) -> u8 {
+            let source_x = x + usize::from(scroll_x);
+            let page = (source_x / 256) % 2;
+            let tx = (source_x % 256) / 8;
+            let ty = y / 8;
+            let row = y % 8;
+
+            let mut pixel = if (tx + ty + page) % 2 == 0 {
+                // 图块 1。
+                (source_x % 4) as u8 ^ (row & 1) as u8 ^ if row >= 4 { 2 } else { 0 }
+            } else {
+                // 图块 2。
+                1
+            };
+
+            let mut palette = u8::from(tx & 2 != 0) | (u8::from(ty & 2 != 0) << 1);
+
+            if page == 1 {
+                palette = 3 - palette;
+            }
+
+            if mask & 0x08 == 0 || (x < 8 && mask & 0x02 == 0) {
+                pixel = 0;
+            }
+
+            let color = if pixel == 0 {
+                0x0F
+            } else {
+                0x20 + palette * 4 + pixel
+            };
+
+            color & if mask & 1 != 0 { 0x30 } else { 0x3F }
+        }
+
+        fn assert_frame(ppu: &Ppu, scroll_x: u8, mask: u8) {
+            assert_eq!(ppu.framebuffer().len(), 256 * 240);
+
+            for y in 0..240usize {
+                for x in 0..256usize {
+                    assert_eq!(
+                        ppu.framebuffer()[y * 256 + x],
+                        expected_pixel(x, y, scroll_x, mask),
+                        "pixel ({x}, {y}), scroll={scroll_x}, mask={mask:02X}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn renders_complete_background_and_horizontal_scroll() {
+            for scroll_x in [0, 3] {
+                let (mut ppu, cart) = fixture(0x0A, scroll_x);
+                render_frame(&mut ppu, &cart);
+                assert_frame(&ppu, scroll_x, 0x0A);
+            }
+        }
+
+        #[test]
+        fn clips_left_eight_pixels_and_supports_greyscale() {
+            for mask in [0x08, 0x0B] {
+                let (mut ppu, cart) = fixture(mask, 0);
+                render_frame(&mut ppu, &cart);
+                assert_frame(&ppu, 0, mask);
+            }
+        }
+
+        #[test]
+        fn disabled_rendering_needs_no_cartridge_and_keeps_v() {
+            let mut ppu = Ppu::new();
+            ppu.v = 0x1234;
+            ppu.t = 0x5678;
+            ppu.mask = 0;
+            ppu.palette_ram[0] = 0x0F;
+
+            for _ in 0..341 {
+                ppu.clock(None).unwrap();
+            }
+
+            assert_eq!(ppu.v, 0x1234);
+            assert_eq!(ppu.t, 0x5678);
+            assert_eq!(ppu.scanline, 1);
+            assert_eq!(ppu.dot, 0);
+            assert!(ppu.framebuffer()[..256].iter().all(|&v| v == 0x0F));
+        }
+
+        #[test]
+        fn sprite_enable_alone_runs_background_fetch_pipeline() {
+            let (mut ppu, cart) = fixture(0x10, 0);
+
+            ppu.scanline = 0;
+            ppu.dot = 1;
+            ppu.v = 0;
+
+            for _ in 0..8 {
+                ppu.clock(Some(&cart)).unwrap();
+            }
+
+            // 背景不可见，但取数和地址递增仍运行。
+            assert_eq!(ppu.v & 0x001F, 1);
+            assert_eq!(ppu.next_tile_id, 1);
+            assert!(ppu.framebuffer()[..8].iter().all(|&v| v == 0x0F));
+        }
+
+        #[test]
+        fn clock_applies_scroll_updates_at_the_required_dots() {
+            let (mut ppu, cart) = fixture(0x0A, 0);
+
+            ppu.scanline = 10;
+            ppu.dot = 256;
+            ppu.v = 0;
+            ppu.clock(Some(&cart)).unwrap();
+            assert_eq!(ppu.v, 0x1001); // 横向 +1，fine Y +1。
+
+            ppu.t = 0x0415;
+            ppu.clock(Some(&cart)).unwrap(); // dot 257
+            assert_eq!(ppu.v, 0x1415);
+
+            ppu.scanline = 261;
+            ppu.dot = 280;
+            ppu.t = 0x32A0;
+            ppu.clock(Some(&cart)).unwrap();
+            assert_eq!(ppu.v, 0x36B5);
+
+            // 验证不是只在 280 或 304 复制一次。
+            ppu.t = 0x0840;
+            ppu.clock(Some(&cart)).unwrap(); // dot 281
+            assert_eq!(ppu.v, 0x0C55);
+        }
+
+        #[test]
+        fn active_background_fetch_requires_a_cartridge() {
+            let mut ppu = Ppu::new();
+            ppu.mask = 0x08;
+            ppu.scanline = 0;
+            ppu.dot = 2;
+
+            assert!(ppu.clock(None).is_err());
         }
     }
 }

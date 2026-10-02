@@ -83,16 +83,16 @@ impl Bus {
         &self.ppu
     }
 
-    pub(crate) fn clock_cpu_cycle(&mut self) -> [bool; 3] {
+    pub(crate) fn clock_cpu_cycle(&mut self) -> Result<[bool; 3], String> {
         // 调用三次 self.ppu.clock()。
         let mut levels = [false; 3];
 
         for level in &mut levels {
-            self.ppu.clock();
+            self.ppu.clock(self.cartridge.as_ref())?;
             *level = self.ppu.nmi_line();
         }
 
-        levels
+        Ok(levels)
     }
 }
 
