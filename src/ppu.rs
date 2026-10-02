@@ -52,6 +52,14 @@ struct SpriteRow {
     pixels: [u8; 8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpritePixel {
+    pixel: u8,
+    palette: u8,
+    behind_background: bool,
+    is_sprite_zero: bool,
+}
+
 pub struct Ppu {
     dot: u16,
     scanline: u16,
@@ -88,6 +96,9 @@ pub struct Ppu {
     framebuffer: Vec<u8>,
     oam: [u8; 256],
     oam_addr: u8,
+
+    sprite_rows: Vec<SpriteRow>,      // 当前扫描线
+    next_sprite_rows: Vec<SpriteRow>, // 下一条扫描线
 }
 
 impl Ppu {
@@ -118,6 +129,8 @@ impl Ppu {
             framebuffer: vec![0; 256 * 240],
             oam: [0u8; 256],
             oam_addr: 0,
+            sprite_rows: Vec::<SpriteRow>::new(),
+            next_sprite_rows: Vec::<SpriteRow>::new(),
         }
     }
 
@@ -153,25 +166,29 @@ impl Ppu {
             self.status = self.status & 0x1F;
         }
 
-        // render background
-        if self.scanline <= 239 && self.dot >= 1 && self.dot <= 256 {
-            let (mut pixel, palette) = self.background_pixel();
-            let x = usize::from(self.dot - 1);
+        if self.scanline == 261 && self.dot == 1 {
+            self.status &= !0xE0;
+        }
+
+        // render background and sprite
+        // 可见区域：背景和精灵合成后输出。
+        if self.scanline < 240 && (1..=256).contains(&self.dot) {
+            let x = self.dot - 1;
             let y = usize::from(self.scanline);
 
-            if self.mask & 0x08 == 0 || (x < 8 && self.mask & 0x02 == 0) {
-                pixel = 0;
-            }
+            let (background_pixel, background_palette) = self.background_pixel();
 
-            let addr = if pixel == 0 {
-                0x3F00
+            let palette_addr = self.compose_pixel(x, background_pixel, background_palette);
+
+            let color = self.palette_ram[palette_index(palette_addr)];
+
+            let color_mask = if self.mask & 0x01 != 0 {
+                0x30 // 灰度模式
             } else {
-                0x3F00 + u16::from(palette) * 4 + u16::from(pixel)
+                0x3F
             };
-            let color_mask = if self.mask & 0x01 != 0 { 0x30 } else { 0x3F };
-            let color = self.palette_ram[palette_index(addr)];
 
-            self.framebuffer[y * 256 + x] = color & color_mask;
+            self.framebuffer[y * 256 + usize::from(x)] = color & color_mask;
         }
 
         let render_line = self.scanline < 240 || self.scanline == 261;
@@ -224,6 +241,8 @@ impl Ppu {
                 self.copy_scroll_y();
             }
         }
+
+        self.clock_sprites(cartridge)?;
 
         self.dot += 1;
         if self.dot == 341_u16 {
@@ -665,6 +684,103 @@ impl Ppu {
         }
 
         Ok(sprites)
+    }
+
+    // 取得当前 X 的精灵像素
+    fn sprite_pixel(&self, x: u16) -> Option<SpritePixel> {
+        if x >= 256 {
+            return None;
+        }
+
+        for row in &self.sprite_rows {
+            let sprite_x = u16::from(row.x);
+            let in_range = (sprite_x..sprite_x + 8).contains(&x);
+            if !in_range {
+                continue;
+            }
+            let pixel = row.pixels[usize::from(x) - usize::from(row.x)];
+            if pixel == 0 {
+                continue;
+            }
+            return Some(SpritePixel {
+                pixel: pixel,
+                palette: row.palette,
+                behind_background: row.behind_background,
+                is_sprite_zero: row.oam_index == 0,
+            });
+        }
+
+        None
+    }
+
+    // 合成并返回调色板地址
+    fn compose_pixel(&mut self, x: u16, background_pixel: u8, background_palette: u8) -> u16 {
+        if x >= 256 {
+            return 0x3F00;
+        }
+
+        // 背景是否允许在这个位置显示。
+        let background_visible = self.mask & 0x08 != 0 && (x >= 8 || self.mask & 0x02 != 0);
+
+        let background_pixel = if background_visible {
+            background_pixel
+        } else {
+            0
+        };
+
+        // 精灵是否允许在这个位置显示。
+        let sprite_visible = self.mask & 0x10 != 0 && (x >= 8 || self.mask & 0x04 != 0);
+
+        let sprite = if sprite_visible {
+            self.sprite_pixel(x)
+        } else {
+            None
+        };
+
+        if let Some(sprite) = sprite {
+            // sprite_pixel() 保证返回的精灵像素非透明。
+            // 命中与精灵在背景前面还是后面无关。
+            if sprite.is_sprite_zero && background_pixel != 0 && x != 255 {
+                self.status |= 0x40;
+            }
+
+            // 背景透明，或者精灵位于背景前面：显示精灵。
+            if background_pixel == 0 || !sprite.behind_background {
+                return 0x3F10 + u16::from(sprite.palette) * 4 + u16::from(sprite.pixel);
+            }
+        }
+
+        // 没有精灵，或者选中的精灵被不透明背景遮挡。
+        if background_pixel != 0 {
+            0x3F00 + u16::from(background_palette) * 4 + u16::from(background_pixel)
+        } else {
+            0x3F00
+        }
+    }
+
+    fn clock_sprites(&mut self, cartridge: Option<&Cartridge>) -> Result<(), String> {
+        // 新的可见扫描线开始：接收上一行准备好的数据。
+        if self.scanline < 240 && self.dot == 0 {
+            self.sprite_rows = std::mem::take(&mut self.next_sprite_rows);
+        }
+
+        if self.dot == 257 {
+            // 防止没有准备新数据时复用旧数据。
+            self.next_sprite_rows.clear();
+
+            let rendering_enabled = self.mask & 0x18 != 0;
+
+            // 第 0～238 行分别准备第 1～239 行。
+            // 不为非可见行或第 0 行准备精灵。
+            if self.scanline < 239 && rendering_enabled {
+                let cartridge =
+                    cartridge.ok_or_else(|| "No cartridge for sprite rendering".to_string())?;
+
+                self.next_sprite_rows = self.collect_sprite_rows(self.scanline + 1, cartridge)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1744,6 +1860,206 @@ mod tests {
             }
 
             assert!(ppu.collect_sprite_rows(17, &cartridge).unwrap().is_empty());
+        }
+    }
+
+    #[cfg(test)]
+    mod sprite_composition_tests {
+        use super::*;
+
+        fn row(index: u8, x: u8, pixel: u8, palette: u8, behind: bool) -> SpriteRow {
+            SpriteRow {
+                oam_index: index,
+                x,
+                palette,
+                behind_background: behind,
+                pixels: [pixel; 8],
+            }
+        }
+
+        #[test]
+        fn sprite_selection_skips_transparent_pixels_and_clips_right_edge() {
+            let mut ppu = Ppu::new();
+
+            ppu.sprite_rows = vec![
+                row(2, 40, 0, 1, false),
+                row(5, 40, 3, 2, true),
+                row(6, 40, 1, 0, false),
+            ];
+
+            assert_eq!(ppu.sprite_pixel(39), None);
+            assert_eq!(
+                ppu.sprite_pixel(42),
+                Some(SpritePixel {
+                    pixel: 3,
+                    palette: 2,
+                    behind_background: true,
+                    is_sprite_zero: false,
+                })
+            );
+            assert_eq!(ppu.sprite_pixel(48), None);
+
+            // 每个 X 必须重新选择：前一个精灵这一像素不再透明。
+            ppu.sprite_rows[0].pixels[2] = 1;
+            assert_eq!(ppu.sprite_pixel(42).unwrap().palette, 1);
+
+            ppu.sprite_rows = vec![row(0, 254, 2, 0, false)];
+            assert!(ppu.sprite_pixel(254).is_some());
+            assert!(ppu.sprite_pixel(255).is_some());
+            assert_eq!(ppu.sprite_pixel(256), None);
+            assert_eq!(ppu.sprite_pixel(0), None);
+        }
+
+        #[test]
+        fn composition_obeys_transparency_and_background_priority() {
+            let mut ppu = Ppu::new();
+            ppu.mask = 0x1E; // 背景、精灵及其左侧显示全部启用。
+
+            // 使用非零 OAM 序号，避免本测试夹带 sprite 0 hit。
+            ppu.sprite_rows = vec![row(2, 40, 3, 2, false)];
+
+            // 两者不透明，精灵在前。
+            assert_eq!(ppu.compose_pixel(42, 2, 1), 0x3F1B);
+
+            // 精灵在后，显示背景。
+            ppu.sprite_rows[0].behind_background = true;
+            assert_eq!(ppu.compose_pixel(42, 2, 1), 0x3F06);
+
+            // 背景透明时，后方精灵仍然显示。
+            assert_eq!(ppu.compose_pixel(42, 0, 1), 0x3F1B);
+
+            // 精灵透明时显示背景；两者透明则显示通用背景色。
+            ppu.sprite_rows[0].pixels = [0; 8];
+            assert_eq!(ppu.compose_pixel(42, 2, 1), 0x3F06);
+            assert_eq!(ppu.compose_pixel(42, 0, 1), 0x3F00);
+        }
+
+        #[test]
+        fn hidden_frontmost_sprite_does_not_reveal_a_later_sprite() {
+            let mut ppu = Ppu::new();
+            ppu.mask = 0x1E;
+            ppu.sprite_rows = vec![row(2, 40, 3, 2, true), row(5, 40, 1, 0, false)];
+
+            // 选中 OAM 2 后与背景比较，不能改选 OAM 5。
+            assert_eq!(ppu.compose_pixel(42, 2, 1), 0x3F06);
+        }
+
+        #[test]
+        fn masks_control_both_output_and_sprite_zero_hit() {
+            // mask、X、最终调色板地址、是否命中。
+            let cases: [(u8, u16, u16, bool); 8] = [
+                (0x1E, 0, 0x3F1B, true),
+                (0x1C, 0, 0x3F1B, false), // 左侧背景隐藏。
+                (0x1A, 0, 0x3F06, false), // 左侧精灵隐藏。
+                (0x18, 0, 0x3F00, false), // 左侧两者都隐藏。
+                (0x18, 8, 0x3F1B, true),  // X=8 已不受左侧裁剪。
+                (0x14, 8, 0x3F1B, false), // 背景关闭。
+                (0x0A, 8, 0x3F06, false), // 精灵关闭。
+                (0x00, 8, 0x3F00, false), // 两者关闭。
+            ];
+
+            for (mask, x, expected_addr, hit) in cases {
+                let mut ppu = Ppu::new();
+                ppu.mask = mask;
+                ppu.sprite_rows = vec![row(0, x as u8, 3, 2, false)];
+
+                assert_eq!(
+                    ppu.compose_pixel(x, 2, 1),
+                    expected_addr,
+                    "mask={mask:#04X}, x={x}"
+                );
+                assert_eq!(ppu.status & 0x40 != 0, hit, "mask={mask:#04X}, x={x}");
+            }
+        }
+
+        #[test]
+        fn sprite_zero_hit_ignores_priority_and_remains_set() {
+            let mut ppu = Ppu::new();
+            ppu.mask = 0x1E;
+            ppu.sprite_rows = vec![row(0, 40, 3, 2, true)];
+
+            // 精灵在背景后面也能命中。
+            assert_eq!(ppu.compose_pixel(42, 2, 1), 0x3F06);
+            assert_ne!(ppu.status & 0x40, 0);
+
+            // 下一个像素没有重叠，也不能清除之前的命中。
+            ppu.compose_pixel(100, 0, 0);
+            assert_ne!(ppu.status & 0x40, 0);
+
+            // 预渲染行 dot 1 清除。
+            ppu.scanline = 261;
+            ppu.dot = 1;
+            ppu.clock_test();
+            assert_eq!(ppu.status & 0x40, 0);
+        }
+
+        #[test]
+        fn sprite_zero_hit_rejects_transparency_wrong_index_and_x255() {
+            // OAM 序号、精灵像素、背景像素、X。
+            let cases: [(u8, u8, u8, u16); 4] =
+                [(0, 0, 2, 40), (0, 3, 0, 40), (7, 3, 2, 40), (0, 3, 2, 255)];
+
+            for (index, sprite, background, x) in cases {
+                let mut ppu = Ppu::new();
+                ppu.mask = 0x1E;
+                ppu.sprite_rows = vec![row(index, x as u8, sprite, 2, false)];
+
+                ppu.compose_pixel(x, background, 1);
+                assert_eq!(ppu.status & 0x40, 0);
+            }
+        }
+
+        #[test]
+        fn clock_prepares_next_line_and_writes_sprite_colors() {
+            let mut rom = vec![0u8; 16 + 16 * 1024];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+            let mut cartridge = Cartridge::try_from(rom.as_slice()).unwrap();
+
+            // Tile 2 首行：8 个像素全部为 1。
+            cartridge.ppu_write(0x0020, 0xFF).unwrap();
+            cartridge.ppu_write(0x0028, 0x00).unwrap();
+
+            let mut ppu = Ppu::new();
+            ppu.oam.fill(0xFF);
+            // Y=0 → 屏幕第 1 行；tile=2；palette=0；X=10。
+            ppu.oam[..4].copy_from_slice(&[0, 2, 0, 10]);
+            ppu.mask = 0x14; // 只显示精灵，包括左侧。
+            ppu.palette_ram[0] = 0x0F;
+            ppu.palette_ram[0x11] = 0x2A;
+
+            ppu.scanline = 0;
+            ppu.dot = 257;
+
+            // 到第 1 行 dot 19，已绘制该行 X=0～17。
+            for _ in 0..103 {
+                ppu.clock(Some(&cartridge)).unwrap();
+            }
+
+            assert_eq!((ppu.scanline, ppu.dot), (1, 19));
+            assert_eq!(ppu.sprite_rows.len(), 1);
+
+            for x in 0..18 {
+                let expected = if x >= 10 { 0x2A } else { 0x0F };
+                assert_eq!(ppu.framebuffer[256 + x], expected, "x={x}");
+            }
+
+            // X=18 已在精灵之外。
+            ppu.clock(Some(&cartridge)).unwrap();
+            assert_eq!(ppu.framebuffer[256 + 18], 0x0F);
+
+            // 第 0 行不能复用上一帧残留的精灵。
+            ppu.scanline = 261;
+            ppu.dot = 257;
+            ppu.next_sprite_rows = vec![row(0, 10, 1, 0, false)];
+
+            // 84 个时钟到第 0 行 dot 0，再一个时钟完成切换。
+            for _ in 0..85 {
+                ppu.clock(Some(&cartridge)).unwrap();
+            }
+
+            assert_eq!((ppu.scanline, ppu.dot), (0, 1));
+            assert!(ppu.sprite_rows.is_empty());
         }
     }
 }
