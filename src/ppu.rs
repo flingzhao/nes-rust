@@ -74,6 +74,8 @@ pub struct Ppu {
     bg_attribute_high: u16,
     mask: u8,
     framebuffer: Vec<u8>,
+    oam: [u8; 256],
+    oam_addr: u8,
 }
 
 impl Ppu {
@@ -102,6 +104,8 @@ impl Ppu {
             bg_attribute_high: 0u16,
             mask: 0,
             framebuffer: vec![0; 256 * 240],
+            oam: [0u8; 256],
+            oam_addr: 0,
         }
     }
 
@@ -189,7 +193,6 @@ impl Ppu {
                         // 装载移位寄存器。
                         // 横向地址递增。
                         self.load_background_shifters();
-                        // self.shift_background();
                         self.increment_scroll_x();
                     }
                     _ => {}
@@ -299,6 +302,7 @@ impl Ppu {
                 self.write_latch = false;
                 v
             }
+            0x0004 => self.oam[usize::from(self.oam_addr)],
             0x0000 | 0x0006 => self.io_latch,
             0x0007 => {
                 // 如果是从nametable中读取，会有一个周期的延迟，也就是说read_buffer保存着上次读取的值还没有被使用，
@@ -349,6 +353,19 @@ impl Ppu {
                 self.mask = value;
             }
             0x0002 => {}
+            0x0003 => {
+                self.oam_addr = value;
+            }
+            0x0004 => {
+                let stored = if self.oam_addr & 0x03 == 2 {
+                    value & 0xE3
+                } else {
+                    value
+                };
+
+                self.oam[usize::from(self.oam_addr)] = stored;
+                self.oam_addr = self.oam_addr.wrapping_add(1);
+            }
             0x0005 => {
                 // 位：  14—12    11      10       9—5       4—0
                 // 含义：fine Y   纵向表  横向表   coarse Y  coarse X
@@ -538,6 +555,10 @@ impl Ppu {
         self.bg_pattern_high <<= 1;
         self.bg_attribute_low <<= 1;
         self.bg_attribute_high <<= 1;
+    }
+
+    pub fn oam(&self) -> &[u8; 256] {
+        &self.oam
     }
 }
 

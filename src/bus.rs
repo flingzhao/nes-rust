@@ -10,6 +10,7 @@ pub struct Bus {
     ram: [u8; CPU_RAM_SIZE],
     cartridge: Option<Cartridge>,
     ppu: Ppu,
+    oam_dma_request: Option<u8>,
 
     #[cfg(test)]
     write_trace: Vec<(u16, u8)>,
@@ -23,6 +24,7 @@ impl Bus {
             #[cfg(test)]
             write_trace: Vec::new(),
             ppu: Ppu::new(),
+            oam_dma_request: None,
         }
     }
 
@@ -58,7 +60,7 @@ impl Bus {
     pub fn cpu_write(&mut self, addr: u16, data: u8) -> Result<(), String> {
         #[cfg(test)]
         self.write_trace.push((addr, data));
-        if addr > 0x3FFF {
+        if addr > 0x7FFF {
             return Err(format!("unimplemented address {addr:#06X}"));
         }
         if addr <= CPU_RAM_MAPPED_END {
@@ -70,6 +72,8 @@ impl Bus {
                 .as_mut()
                 .ok_or_else(|| "No cartridge inserted".to_string())?;
             self.ppu.cpu_write(addr, data, cartridge)?;
+        } else if addr == 0x4014 {
+            self.oam_dma_request = Some(data);
         }
         Ok(())
     }
@@ -77,6 +81,10 @@ impl Bus {
     #[cfg(test)]
     pub(crate) fn take_write_trace(&mut self) -> Vec<(u16, u8)> {
         std::mem::take(&mut self.write_trace)
+    }
+
+    pub fn take_oam_dma_request(&mut self) -> Option<u8> {
+        self.oam_dma_request.take()
     }
 
     pub fn ppu(&self) -> &Ppu {

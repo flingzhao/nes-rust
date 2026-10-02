@@ -19,12 +19,11 @@ impl Nes {
         self.cpu.set_nmi_line(self.bus.ppu().nmi_line());
         let cycle = self.cpu.step(&mut self.bus)?;
         for _ in 0..cycle {
-            for asserted in self.bus.clock_cpu_cycle()? {
-                self.cpu.set_nmi_line(asserted);
-            }
+            self.clock_one_cpu_cycle()?;
         }
 
-        self.cpu_cycles = self.cpu_cycles.wrapping_add(cycle as u64);
+        self.run_pending_oam_dma()?;
+
         Ok(cycle)
     }
 
@@ -34,6 +33,44 @@ impl Nes {
 
     pub fn bus(&self) -> &Bus {
         &self.bus
+    }
+
+    fn run_pending_oam_dma(&mut self) -> Result<(), String> {
+        let Some(page) = self.bus.take_oam_dma_request() else {
+            return Ok(());
+        };
+
+        let needs_alignment = self.cpu_cycles & 1 != 0;
+
+        // 暂停周期。
+        self.clock_one_cpu_cycle()?;
+
+        // 必要时增加一个对齐周期。
+        if needs_alignment {
+            self.clock_one_cpu_cycle()?;
+        }
+
+        for offset in 0..256u16 {
+            let source_base = u16::from(page) << 8;
+
+            let value = self.bus.cpu_read(source_base | offset)?;
+            self.clock_one_cpu_cycle()?;
+
+            self.bus.cpu_write(0x2004, value)?;
+            self.clock_one_cpu_cycle()?;
+        }
+        Ok(())
+    }
+
+    fn clock_one_cpu_cycle(&mut self) -> Result<(), String> {
+        let levels = self.bus.clock_cpu_cycle()?;
+
+        for level in levels {
+            self.cpu.set_nmi_line(level);
+        }
+
+        self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
+        Ok(())
     }
 }
 
@@ -155,5 +192,189 @@ mod tests {
         assert!(nes.bus().ppu().nmi_line());
         assert_eq!(nes.step().unwrap(), 3); // JMP $8000
         assert_eq!(nes.step().unwrap(), 3);
+    }
+
+    #[cfg(test)]
+    mod oam_dma_tests {
+        use super::*;
+        // 根据项目结构导入 Cpu、Bus、Cartridge。
+
+        fn fixture() -> Nes {
+            let mut bytes = vec![0u8; 16 + 16 * 1024];
+            bytes[..4].copy_from_slice(b"NES\x1A");
+            bytes[4] = 1;
+
+            // $8000：
+            // LDA #$02
+            // STA $4014
+            // NOP
+            bytes[16..22].copy_from_slice(&[0xA9, 0x02, 0x8D, 0x14, 0x40, 0xEA]);
+
+            // Mapper 0，16 KiB PRG 的复位向量。
+            bytes[16 + 0x3FFC] = 0x00;
+            bytes[16 + 0x3FFD] = 0x80;
+
+            let cart = Cartridge::try_from(bytes.as_slice()).unwrap();
+            let mut bus = Bus::new();
+            bus.insert_cartridge(cart);
+
+            let mut cpu = Cpu::new();
+            cpu.reset(&mut bus).unwrap();
+
+            Nes::new(cpu, bus)
+        }
+
+        fn fill_page(nes: &mut Nes, page: u8, seed: u8) {
+            for offset in 0..256u16 {
+                let addr = (u16::from(page) << 8) | offset;
+                let value = (offset as u8) ^ seed;
+                nes.bus.cpu_write(addr, value).unwrap();
+            }
+        }
+
+        fn expected_oam_byte(destination: u8, value: u8) -> u8 {
+            if destination & 3 == 2 {
+                value & 0xE3
+            } else {
+                value
+            }
+        }
+
+        #[test]
+        fn oam_data_writes_increment_and_reads_do_not() {
+            let mut nes = fixture();
+
+            nes.bus.cpu_write(0x2003, 0xFF).unwrap();
+            nes.bus.cpu_write(0x2004, 0x12).unwrap();
+            nes.bus.cpu_write(0x2004, 0x34).unwrap();
+
+            assert_eq!(nes.bus.ppu().oam()[255], 0x12);
+            assert_eq!(nes.bus.ppu().oam()[0], 0x34);
+
+            nes.bus.cpu_write(0x2003, 0xFF).unwrap();
+
+            assert_eq!(nes.bus.cpu_read(0x2004).unwrap(), 0x12);
+            assert_eq!(nes.bus.cpu_read(0x2004).unwrap(), 0x12);
+
+            // 两次读没有递增，下一次写仍写到 FF。
+            nes.bus.cpu_write(0x2004, 0x56).unwrap();
+            assert_eq!(nes.bus.ppu().oam()[255], 0x56);
+        }
+
+        #[test]
+        fn oam_attribute_unused_bits_read_as_zero() {
+            let mut nes = fixture();
+
+            nes.bus.cpu_write(0x2003, 2).unwrap();
+            nes.bus.cpu_write(0x2004, 0xFF).unwrap();
+
+            nes.bus.cpu_write(0x2003, 2).unwrap();
+            assert_eq!(nes.bus.cpu_read(0x2004).unwrap(), 0xE3);
+
+            // 普通字节不应用属性掩码。
+            nes.bus.cpu_write(0x2003, 3).unwrap();
+            nes.bus.cpu_write(0x2004, 0xFF).unwrap();
+
+            nes.bus.cpu_write(0x2003, 3).unwrap();
+            assert_eq!(nes.bus.cpu_read(0x2004).unwrap(), 0xFF);
+        }
+
+        #[test]
+        fn dma_copies_a_page_and_wraps_from_current_oam_address() {
+            let mut nes = fixture();
+            fill_page(&mut nes, 2, 0xA5);
+
+            let start = 0xFAu8;
+            nes.bus.cpu_write(0x2003, start).unwrap();
+            nes.bus.cpu_write(0x4014, 2).unwrap();
+
+            nes.run_pending_oam_dma().unwrap();
+
+            assert_eq!(nes.cpu_cycles(), 513);
+
+            for offset in 0..256u16 {
+                let destination = start.wrapping_add(offset as u8);
+                let source = (offset as u8) ^ 0xA5;
+
+                assert_eq!(
+                    nes.bus.ppu().oam()[usize::from(destination)],
+                    expected_oam_byte(destination, source),
+                    "source offset={offset}, destination={destination}"
+                );
+            }
+
+            // 写入 256 字节后，OAMADDR 回到起始位置。
+            nes.bus.cpu_write(0x2004, 0x77).unwrap();
+
+            assert_eq!(
+                nes.bus.ppu().oam()[usize::from(start)],
+                expected_oam_byte(start, 0x77)
+            );
+
+            // 已消费的请求不能重复执行。
+            let before = nes.cpu_cycles();
+            nes.run_pending_oam_dma().unwrap();
+            assert_eq!(nes.cpu_cycles(), before);
+        }
+
+        #[test]
+        fn dma_alignment_depends_on_starting_cycle_parity() {
+            for initial_cycles in [0u64, 1] {
+                let mut nes = fixture();
+
+                if initial_cycles == 1 {
+                    nes.clock_one_cpu_cycle().unwrap();
+                }
+
+                nes.bus.cpu_write(0x4014, 2).unwrap();
+                let before = nes.cpu_cycles();
+
+                nes.run_pending_oam_dma().unwrap();
+
+                let expected = if initial_cycles == 0 { 513 } else { 514 };
+                assert_eq!(nes.cpu_cycles() - before, expected);
+            }
+        }
+
+        #[test]
+        fn latest_dma_request_wins_and_cpu_ram_mirrors_are_used() {
+            let mut nes = fixture();
+            fill_page(&mut nes, 2, 0xA5);
+            fill_page(&mut nes, 3, 0x5A);
+
+            nes.bus.cpu_write(0x4014, 2).unwrap();
+
+            // $0B00 镜像到 $0300，且覆盖前一个请求。
+            nes.bus.cpu_write(0x4014, 0x0B).unwrap();
+            nes.run_pending_oam_dma().unwrap();
+
+            for offset in 0..256u16 {
+                let destination = offset as u8;
+                let source = destination ^ 0x5A;
+
+                assert_eq!(
+                    nes.bus.ppu().oam()[usize::from(destination)],
+                    expected_oam_byte(destination, source)
+                );
+            }
+        }
+
+        #[test]
+        fn step_runs_dma_before_executing_the_next_instruction() {
+            let mut nes = fixture();
+            fill_page(&mut nes, 2, 0xA5);
+
+            assert_eq!(nes.step().unwrap(), 2); // LDA
+            assert_eq!(nes.cpu_cycles(), 2);
+
+            assert_eq!(nes.step().unwrap(), 4); // STA + DMA
+            assert_eq!(nes.cpu_cycles(), 2 + 4 + 513);
+
+            assert_eq!(nes.bus.ppu().oam()[0], 0xA5);
+            assert_eq!(nes.bus.ppu().oam()[255], 0xFF ^ 0xA5);
+
+            assert_eq!(nes.step().unwrap(), 2); // DMA 后才执行 NOP
+            assert_eq!(nes.cpu_cycles(), 2 + 4 + 513 + 2);
+        }
     }
 }
