@@ -1,3 +1,4 @@
+use crate::controller::Button;
 use crate::{bus::Bus, cpu::Cpu};
 
 pub struct Nes {
@@ -71,6 +72,36 @@ impl Nes {
 
         self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
         Ok(())
+    }
+
+    pub fn framebuffer(&self) -> &[u8] {
+        self.bus.ppu().framebuffer()
+    }
+
+    pub fn run_until_frame(&mut self) -> Result<(), String> {
+        if self.bus.take_frame_ready() {
+            return Ok(());
+        }
+        for _ in 0..100_000 {
+            self.step()?;
+            if self.bus.take_frame_ready() {
+                return Ok(());
+            }
+        }
+        Err("PPU frame was not ready after 100000 CPU steps".to_string())
+    }
+
+    pub fn set_controller_button(
+        &mut self,
+        port: usize,
+        button: Button,
+        pressed: bool,
+    ) -> Result<(), String> {
+        self.bus.set_controller_button(port, button, pressed)
+    }
+
+    pub fn release_all_buttons(&mut self) {
+        self.bus.release_all_buttons();
     }
 }
 
@@ -375,6 +406,59 @@ mod tests {
 
             assert_eq!(nes.step().unwrap(), 2); // DMA 后才执行 NOP
             assert_eq!(nes.cpu_cycles(), 2 + 4 + 513 + 2);
+        }
+    }
+
+    #[cfg(test)]
+    mod frame_runner_tests {
+        use super::*;
+
+        fn looping_nes() -> Nes {
+            let mut rom = vec![0u8; 16 + 16 * 1024];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+
+            // $8000: JMP $8000
+            rom[16..19].copy_from_slice(&[0x4C, 0x00, 0x80]);
+
+            // 16 KiB PRG 镜像下的 reset vector。
+            rom[16 + 0x3FFC] = 0x00;
+            rom[16 + 0x3FFD] = 0x80;
+
+            let cartridge = Cartridge::try_from(rom.as_slice()).unwrap();
+            let mut bus = Bus::new();
+            bus.insert_cartridge(cartridge);
+
+            let mut cpu = Cpu::new();
+            cpu.reset(&mut bus).unwrap();
+
+            Nes::new(cpu, bus)
+        }
+
+        #[test]
+        fn runs_cpu_and_consumes_each_frame_notification() {
+            let mut nes = looping_nes();
+
+            let before = nes.cpu_cycles();
+            nes.run_until_frame().unwrap();
+
+            assert!(nes.cpu_cycles() > before);
+            assert_eq!(nes.framebuffer().len(), 256 * 240);
+            assert!(nes.framebuffer().iter().all(|&color| color < 64));
+            assert!(!nes.bus.take_frame_ready());
+
+            // 第二次不能直接返回上一帧的通知。
+            let before = nes.cpu_cycles();
+            nes.run_until_frame().unwrap();
+            let elapsed = nes.cpu_cycles() - before;
+
+            // 两次画面完成通知之间约为 29781 个 CPU 周期。
+            // 不写死精确值，允许指令边界造成的小偏差。
+            assert!(
+                (29_000..31_000).contains(&elapsed),
+                "unexpected CPU cycles between frames: {elapsed}"
+            );
+            assert!(!nes.bus.take_frame_ready());
         }
     }
 }

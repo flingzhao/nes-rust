@@ -1,4 +1,5 @@
-use crate::cartridge::{self, Cartridge};
+use crate::cartridge::Cartridge;
+use crate::controller::{Button, Controller};
 use crate::ppu::Ppu;
 
 const CPU_RAM_SIZE: usize = 0x800;
@@ -11,6 +12,7 @@ pub struct Bus {
     cartridge: Option<Cartridge>,
     ppu: Ppu,
     oam_dma_request: Option<u8>,
+    controllers: [Controller; 2],
 
     #[cfg(test)]
     write_trace: Vec<(u16, u8)>,
@@ -25,6 +27,7 @@ impl Bus {
             write_trace: Vec::new(),
             ppu: Ppu::new(),
             oam_dma_request: None,
+            controllers: [Controller::new(), Controller::new()],
         }
     }
 
@@ -49,6 +52,8 @@ impl Bus {
                 // TODO(APU): 暂时报告无活动声道、无 APU IRQ。
                 Ok(0)
             }
+            0x4016 => Ok(self.controllers[0].read()),
+            0x4017 => Ok(self.controllers[1].read()),
             0x8000..=0xFFFF => {
                 let cartridge = self
                     .cartridge
@@ -57,7 +62,8 @@ impl Bus {
 
                 cartridge.cpu_read(addr)
             }
-            _ => Err("unimplemented addr access".to_string()),
+            _ => Err(format!("unimplemented addr access: {addr:#04X}")),
+            // _ => Ok(0),
         }
     }
 
@@ -76,6 +82,10 @@ impl Bus {
                 .as_mut()
                 .ok_or_else(|| "No cartridge inserted".to_string())?;
             self.ppu.cpu_write(addr, data, cartridge)?;
+        } else if addr == 0x4016 {
+            for controller in &mut self.controllers {
+                controller.write_strobe(data);
+            }
         } else if addr == 0x4014 {
             self.oam_dma_request = Some(data);
         } else {
@@ -107,6 +117,32 @@ impl Bus {
         }
 
         Ok(levels)
+    }
+
+    pub fn take_frame_ready(&mut self) -> bool {
+        self.ppu.take_frame_ready()
+    }
+
+    // impl Bus
+    pub fn set_controller_button(
+        &mut self,
+        port: usize,
+        button: Button,
+        pressed: bool,
+    ) -> Result<(), String> {
+        let controller = self
+            .controllers
+            .get_mut(port)
+            .ok_or_else(|| format!("Invalid controller port: {port}"))?;
+
+        controller.set_button(button, pressed);
+        Ok(())
+    }
+
+    pub fn release_all_buttons(&mut self) {
+        for controller in &mut self.controllers {
+            controller.release_all();
+        }
     }
 }
 
