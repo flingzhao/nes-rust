@@ -1,5 +1,3 @@
-use sdl2::pixels;
-
 use crate::cartridge::{Cartridge, Mirroring};
 use crate::debug_video::decode_tile_row;
 
@@ -99,6 +97,8 @@ pub struct Ppu {
 
     sprite_rows: Vec<SpriteRow>,      // 当前扫描线
     next_sprite_rows: Vec<SpriteRow>, // 下一条扫描线
+
+    frame_ready: bool,
 }
 
 impl Ppu {
@@ -131,6 +131,7 @@ impl Ppu {
             oam_addr: 0,
             sprite_rows: Vec::<SpriteRow>::new(),
             next_sprite_rows: Vec::<SpriteRow>::new(),
+            frame_ready: false,
         }
     }
 
@@ -243,6 +244,20 @@ impl Ppu {
         }
 
         self.clock_sprites(cartridge)?;
+
+        let skip_dot =
+            self.scanline == 261 && self.dot == 339 && self.frame & 1 != 0 && self.mask & 0x18 != 0;
+
+        if skip_dot {
+            self.dot = 0;
+            self.scanline = 0;
+            self.frame = self.frame.wrapping_add(1);
+            return Ok(());
+        }
+
+        if self.scanline == 240 && self.dot == 0 {
+            self.frame_ready = true;
+        }
 
         self.dot += 1;
         if self.dot == 341_u16 {
@@ -781,6 +796,10 @@ impl Ppu {
         }
 
         Ok(())
+    }
+
+    pub fn take_frame_ready(&mut self) -> bool {
+        std::mem::take(&mut self.frame_ready)
     }
 }
 
@@ -2060,6 +2079,138 @@ mod tests {
 
             assert_eq!((ppu.scanline, ppu.dot), (0, 1));
             assert!(ppu.sprite_rows.is_empty());
+        }
+    }
+
+    #[cfg(test)]
+    mod frame_delivery_tests {
+        use super::*;
+
+        fn cartridge() -> Cartridge {
+            let mut rom = vec![0u8; 16 + 16 * 1024];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+            Cartridge::try_from(rom.as_slice()).unwrap()
+        }
+
+        // 从帧起点运行到下一个帧起点，有上限，避免错误实现死循环。
+        fn run_frame(ppu: &mut Ppu, cartridge: &Cartridge) -> usize {
+            assert_eq!((ppu.scanline, ppu.dot), (0, 0));
+
+            let starting_frame = ppu.frame;
+
+            for ticks in 1..=90_000 {
+                ppu.clock(Some(cartridge)).unwrap();
+
+                if ppu.frame != starting_frame {
+                    assert_eq!((ppu.scanline, ppu.dot), (0, 0));
+                    return ticks;
+                }
+            }
+
+            panic!("PPU did not finish a frame within 90000 clocks");
+        }
+
+        #[test]
+        fn frame_length_depends_on_parity_and_rendering() {
+            let cartridge = cartridge();
+
+            // 背景、精灵任意一个启用，都属于渲染开启。
+            for mask in [0x00, 0x08, 0x10, 0x18] {
+                let mut ppu = Ppu::new();
+                ppu.oam.fill(0xFF);
+                ppu.mask = mask;
+                ppu.frame = 0;
+                ppu.scanline = 0;
+                ppu.dot = 0;
+
+                assert_eq!(run_frame(&mut ppu, &cartridge), 89_342);
+
+                let odd_length = if mask == 0 { 89_342 } else { 89_341 };
+                assert_eq!(
+                    run_frame(&mut ppu, &cartridge),
+                    odd_length,
+                    "mask={mask:#04X}"
+                );
+
+                assert_eq!(ppu.frame, 2);
+            }
+        }
+
+        #[test]
+        fn odd_frame_skips_only_when_rendering_is_enabled() {
+            let cartridge = cartridge();
+
+            for (frame, mask, expected) in [
+                (1u64, 0x08u8, (2u64, 0u16, 0u16)),
+                (1, 0x00, (1, 261, 340)),
+                (0, 0x08, (0, 261, 340)),
+            ] {
+                let mut ppu = Ppu::new();
+                ppu.frame = frame;
+                ppu.mask = mask;
+                ppu.scanline = 261;
+                ppu.dot = 339;
+
+                ppu.clock(Some(&cartridge)).unwrap();
+
+                assert_eq!((ppu.frame, ppu.scanline, ppu.dot), expected);
+            }
+        }
+
+        #[test]
+        fn frame_ready_is_consumed_without_changing_pixels() {
+            let mut ppu = Ppu::new();
+            ppu.mask = 0;
+            ppu.scanline = 239;
+            ppu.dot = 256;
+            ppu.palette_ram[0] = 0x0F;
+
+            // 输出最后一个可见像素，但尚未到通知位置。
+            ppu.clock(None).unwrap();
+            assert!(!ppu.take_frame_ready());
+            assert_eq!(ppu.framebuffer().len(), 256 * 240);
+            assert_eq!(ppu.framebuffer()[256 * 240 - 1], 0x0F);
+
+            // 从 (239,257) 前进到 (240,0)。
+            for _ in 0..84 {
+                ppu.clock(None).unwrap();
+            }
+            assert_eq!((ppu.scanline, ppu.dot), (240, 0));
+            assert!(!ppu.take_frame_ready());
+
+            // 处理 (240,0)，产生软件通知。
+            ppu.clock(None).unwrap();
+
+            let before = ppu.framebuffer().to_vec();
+            assert!(ppu.take_frame_ready());
+            assert!(!ppu.take_frame_ready());
+            assert_eq!(ppu.framebuffer(), before.as_slice());
+
+            // 画面完成通知不能提前设置 VBlank。
+            assert_eq!(ppu.status & 0x80, 0);
+        }
+
+        #[test]
+        fn formal_clock_preserves_vblank_and_prerender_events() {
+            let mut ppu = Ppu::new();
+            ppu.mask = 0;
+            ppu.ctrl = 0x80; // 允许 VBlank NMI。
+            ppu.scanline = 241;
+            ppu.dot = 1;
+
+            ppu.clock(None).unwrap();
+            assert_ne!(ppu.status & 0x80, 0);
+            assert!(ppu.nmi_line());
+
+            // 预渲染行清除 VBlank、sprite 0 hit 和 overflow。
+            ppu.status |= 0x60;
+            ppu.scanline = 261;
+            ppu.dot = 1;
+
+            ppu.clock(None).unwrap();
+            assert_eq!(ppu.status & 0xE0, 0);
+            assert!(!ppu.nmi_line());
         }
     }
 }

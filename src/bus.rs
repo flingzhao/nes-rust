@@ -45,6 +45,10 @@ impl Bus {
                     .ok_or_else(|| "No cartridge inserted".to_string())?;
                 Ok(self.ppu.cpu_read(addr, cartridge)?)
             }
+            0x4015 => {
+                // TODO(APU): 暂时报告无活动声道、无 APU IRQ。
+                Ok(0)
+            }
             0x8000..=0xFFFF => {
                 let cartridge = self
                     .cartridge
@@ -74,6 +78,8 @@ impl Bus {
             self.ppu.cpu_write(addr, data, cartridge)?;
         } else if addr == 0x4014 {
             self.oam_dma_request = Some(data);
+        } else {
+            println!("unimplemented addr write: 0x{addr:04X}");
         }
         Ok(())
     }
@@ -146,5 +152,29 @@ mod tests {
 
         assert!(bus.cpu_read(0x2000).is_err());
         assert!(bus.cpu_write(0x8000, 1).is_err());
+    }
+
+    #[cfg(test)]
+    mod silent_apu_tests {
+        use super::*;
+
+        #[test]
+        fn accepts_apu_writes_without_starting_dma() {
+            let mut bus = Bus::new();
+
+            for addr in 0x4000u16..=0x4013 {
+                bus.cpu_write(addr, 0xFF).unwrap();
+            }
+            bus.cpu_write(0x4015, 0x1F).unwrap();
+            bus.cpu_write(0x4017, 0x40).unwrap();
+
+            assert_eq!(bus.cpu_read(0x4015).unwrap(), 0);
+            assert_eq!(bus.take_oam_dma_request(), None);
+
+            // 确认新增分支没有吞掉 OAM DMA。
+            bus.cpu_write(0x4014, 0x02).unwrap();
+            assert_eq!(bus.take_oam_dma_request(), Some(0x02));
+            assert_eq!(bus.take_oam_dma_request(), None);
+        }
     }
 }
