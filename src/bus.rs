@@ -1,3 +1,4 @@
+use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::controller::{Button, Controller};
 use crate::ppu::Ppu;
@@ -13,6 +14,7 @@ pub struct Bus {
     ppu: Ppu,
     oam_dma_request: Option<u8>,
     controllers: [Controller; 2],
+    apu: Apu,
 
     #[cfg(test)]
     write_trace: Vec<(u16, u8)>,
@@ -26,6 +28,7 @@ impl Bus {
             #[cfg(test)]
             write_trace: Vec::new(),
             ppu: Ppu::new(),
+            apu: Apu::new(),
             oam_dma_request: None,
             controllers: [Controller::new(), Controller::new()],
         }
@@ -50,7 +53,7 @@ impl Bus {
             }
             0x4015 => {
                 // TODO(APU): 暂时报告无活动声道、无 APU IRQ。
-                Ok(0)
+                Ok(self.apu.read_status())
             }
             0x4016 => Ok(self.controllers[0].read()),
             0x4017 => Ok(self.controllers[1].read()),
@@ -88,6 +91,8 @@ impl Bus {
             }
         } else if addr == 0x4014 {
             self.oam_dma_request = Some(data);
+        } else if matches!(addr, 0x4000..=0x4013 | 0x4015 | 0x4017) {
+            self.apu.write_register(addr, data);
         } else {
             println!("unimplemented addr write: 0x{addr:04X}");
         }
@@ -115,6 +120,8 @@ impl Bus {
             self.ppu.clock(self.cartridge.as_ref())?;
             *level = self.ppu.nmi_line();
         }
+
+        self.apu.clock_cpu_cycle();
 
         Ok(levels)
     }
@@ -211,6 +218,52 @@ mod tests {
             bus.cpu_write(0x4014, 0x02).unwrap();
             assert_eq!(bus.take_oam_dma_request(), Some(0x02));
             assert_eq!(bus.take_oam_dma_request(), None);
+        }
+    }
+
+    #[cfg(test)]
+    mod apu_register_bus_tests {
+        use super::*;
+
+        #[test]
+        fn bus_routes_pulse_registers_and_clocks_apu_once_per_cpu_cycle() {
+            let mut bus = Bus::new();
+
+            bus.cpu_write(0x4015, 1).unwrap();
+            bus.cpu_write(0x4000, 0x1A).unwrap();
+            bus.cpu_write(0x4002, 8).unwrap();
+            bus.cpu_write(0x4003, 0x18).unwrap();
+
+            assert_eq!(bus.cpu_read(0x4015).unwrap(), 1);
+            assert_eq!(bus.apu.pulse_outputs(), [0, 0]);
+
+            bus.clock_cpu_cycle().unwrap();
+            assert_eq!(bus.apu.pulse_outputs(), [0, 0]);
+
+            bus.clock_cpu_cycle().unwrap();
+            assert_eq!(bus.apu.pulse_outputs(), [10, 0]);
+
+            bus.cpu_write(0x4015, 0).unwrap();
+            assert_eq!(bus.cpu_read(0x4015).unwrap(), 0);
+            assert_eq!(bus.apu.pulse_outputs(), [0, 0]);
+        }
+
+        #[test]
+        fn apu_routing_preserves_dma_and_second_controller_reads() {
+            let mut bus = Bus::new();
+
+            bus.set_controller_button(1, Button::A, true).unwrap();
+            bus.cpu_write(0x4016, 1).unwrap();
+
+            // 写 $4017 属于 APU，读 $4017 仍然属于第二个手柄。
+            bus.cpu_write(0x4017, 0x40).unwrap();
+            assert_eq!(bus.cpu_read(0x4017).unwrap() & 1, 1);
+
+            bus.cpu_write(0x4000, 0x1A).unwrap();
+            assert_eq!(bus.take_oam_dma_request(), None);
+
+            bus.cpu_write(0x4014, 0x02).unwrap();
+            assert_eq!(bus.take_oam_dma_request(), Some(0x02));
         }
     }
 }
