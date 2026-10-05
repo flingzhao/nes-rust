@@ -51,6 +51,11 @@ impl Apu {
         self.pulses[1].clock_half_frame();
     }
 
+    pub fn clock_quarter_frame(&mut self) {
+        self.pulses[0].clock_quarter_frame();
+        self.pulses[1].clock_quarter_frame();
+    }
+
     // 返回两个声道各自的原始输出，不做混音。
     pub fn pulse_outputs(&self) -> [u8; 2] {
         let volume0 = self.pulses[0].output();

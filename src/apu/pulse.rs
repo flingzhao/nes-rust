@@ -24,6 +24,9 @@ pub(super) struct PulseChannel {
     enabled: bool,               // $4015 对应的使能位, 是否允许装载长度
     length_counter: u8,          // $4003 当前剩余长度计数
     control: u8,                 // $4000 或 $4004 的原始字节
+    envelope_start: bool,
+    envelope_divider: u8,
+    envelope_decay: u8,
 }
 
 impl PulseOscillator {
@@ -68,6 +71,10 @@ impl PulseOscillator {
     }
 
     pub fn output(&self) -> u8 {
+        self.output_with_volume(self.volume)
+    }
+
+    pub(super) fn output_with_volume(&self, volume: u8) -> u8 {
         if self.timer_period < 8 {
             return 0;
         }
@@ -75,7 +82,7 @@ impl PulseOscillator {
         let value = DUTY_SEQUENCES[usize::from(self.duty)][usize::from(self.sequence_step)];
         match value {
             0 => 0,
-            1 => self.volume,
+            1 => volume,
             _ => 0,
         }
     }
@@ -92,6 +99,9 @@ impl PulseChannel {
             enabled,
             length_counter,
             control,
+            envelope_start: false,
+            envelope_divider: 0,
+            envelope_decay: 0,
         }
     }
 
@@ -107,7 +117,7 @@ impl PulseChannel {
                 // - VVVV：固定音量模式下的音量。
                 self.control = value;
                 self.oscillator.duty = value >> 6;
-                self.oscillator.volume = value & 0x0F;
+                // self.oscillator.volume = value & 0x0F;
             }
             0x0001 => {}
             0x0002 => {
@@ -126,6 +136,7 @@ impl PulseChannel {
                     let index = usize::from(value >> 3);
                     self.length_counter = LENGTH_TABLE[index];
                 }
+                self.envelope_start = true;
             }
             _ => unreachable!("apu register only support 0/1/2/3"),
         }
@@ -154,18 +165,36 @@ impl PulseChannel {
     }
 
     pub(super) fn output(&self) -> u8 {
-        // TODO: 包络模式下也会返回0
         if !self.enabled || !self.is_active() {
             return 0;
         }
 
-        let constant_volume = self.control & 0x10 != 0;
-        if !constant_volume {
-            // TODO：实现包络输出。
-            // 这是当前功能尚未实现的临时处理，不是硬件规则。
-            return 0;
+        let volume = if self.control & 0x10 != 0 {
+            self.control & 0x0F // C=1：固定音量。
+        } else {
+            self.envelope_decay // C=0：当前包络音量
+        };
+
+        self.oscillator.output_with_volume(volume)
+    }
+
+    pub(super) fn clock_quarter_frame(&mut self) {
+        if self.envelope_start {
+            self.envelope_start = false;
+            self.envelope_decay = 15;
+            self.envelope_divider = self.control & 0x0F;
+            return;
         }
 
-        self.oscillator.output()
+        if self.envelope_divider > 0 {
+            self.envelope_divider -= 1;
+        } else {
+            self.envelope_divider = self.control & 0x0F;
+            if self.envelope_decay > 0 {
+                self.envelope_decay -= 1;
+            } else if self.control & 0x20 != 0 {
+                self.envelope_decay = 15;
+            }
+        }
     }
 }
