@@ -1,15 +1,21 @@
+pub mod frame_counter;
 pub mod pulse;
 
+use frame_counter::FrameCounter;
 use pulse::PulseChannel;
 
 pub struct Apu {
     pulses: [PulseChannel; 2],
+    frame_counter: FrameCounter,
 }
 
 impl Apu {
     pub fn new() -> Self {
         let pulses = [PulseChannel::new(), PulseChannel::new()];
-        Self { pulses: pulses }
+        Self {
+            pulses: pulses,
+            frame_counter: FrameCounter::new(),
+        }
     }
 
     pub fn write_register(&mut self, addr: u16, value: u8) {
@@ -45,6 +51,18 @@ impl Apu {
     pub fn clock_cpu_cycle(&mut self) {
         self.pulses[0].clock_cpu_cycle();
         self.pulses[1].clock_cpu_cycle();
+
+        let events = self.frame_counter.clock_cpu_cycle();
+
+        if events.half {
+            self.pulses[0].clock_half_frame();
+            self.pulses[1].clock_half_frame();
+        }
+
+        if events.quarter {
+            self.pulses[0].clock_quarter_frame();
+            self.pulses[1].clock_quarter_frame();
+        }
     }
     pub fn clock_half_frame(&mut self) {
         self.pulses[0].clock_half_frame();
