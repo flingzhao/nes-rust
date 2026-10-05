@@ -11,9 +11,8 @@ pub struct Apu {
 
 impl Apu {
     pub fn new() -> Self {
-        let pulses = [PulseChannel::new(), PulseChannel::new()];
         Self {
-            pulses: pulses,
+            pulses: std::array::from_fn(|_| PulseChannel::new()),
             frame_counter: FrameCounter::new(),
         }
     }
