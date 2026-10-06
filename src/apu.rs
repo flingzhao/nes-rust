@@ -47,7 +47,11 @@ impl Apu {
         let pulse1 = u8::from(self.pulses[0].is_active());
         let pulse2 = u8::from(self.pulses[1].is_active());
 
-        pulse1 | (pulse2 << 1)
+        let irq_bit = u8::from(self.irq_line()) << 6;
+
+        self.frame_counter.clear_frame_irq();
+
+        irq_bit | pulse1 | (pulse2 << 1)
     }
 
     pub fn clock_cpu_cycle(&mut self) {
@@ -66,6 +70,7 @@ impl Apu {
             self.pulses[1].clock_quarter_frame();
         }
     }
+
     pub fn clock_half_frame(&mut self) {
         self.pulses[0].clock_half_frame();
         self.pulses[1].clock_half_frame();
@@ -82,5 +87,9 @@ impl Apu {
         let volume1 = self.pulses[1].output();
 
         [volume0, volume1]
+    }
+
+    pub fn irq_line(&self) -> bool {
+        self.frame_counter.irq_line()
     }
 }

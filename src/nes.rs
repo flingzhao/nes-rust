@@ -18,6 +18,7 @@ impl Nes {
 
     pub fn step(&mut self) -> Result<u8, String> {
         self.cpu.set_nmi_line(self.bus.ppu().nmi_line());
+        self.cpu.set_irq_line(self.bus.irq_line());
         let cycle = self.cpu.step(&mut self.bus)?;
         for _ in 0..cycle {
             self.clock_one_cpu_cycle()?;
@@ -65,6 +66,8 @@ impl Nes {
 
     fn clock_one_cpu_cycle(&mut self) -> Result<(), String> {
         let levels = self.bus.clock_cpu_cycle()?;
+        // 在当前apu运行一个cpu周期后，更新irq
+        self.cpu.set_irq_line(self.bus.irq_line());
 
         for level in levels {
             self.cpu.set_nmi_line(level);
@@ -459,6 +462,164 @@ mod tests {
                 "unexpected CPU cycles between frames: {elapsed}"
             );
             assert!(!nes.bus.take_frame_ready());
+        }
+    }
+
+    // 将本文件整个追加到 /home/hgg/src/nes/src/nes.rs 的末尾。
+    // 不替换已有 tests 模块。要求新增 Apu::irq_line()、Bus::irq_line()。
+    // 这些测试针对本轮“按 CPU 周期推进、顺序访问寄存器”的模型；
+    // 不验证真实硬件同周期读 $4015 与 IRQ 置位的相位竞争。
+    #[cfg(test)]
+    mod apu_frame_irq_tests {
+        use super::*;
+        use crate::apu::Apu;
+        use crate::cartridge::Cartridge;
+
+        fn advance(apu: &mut Apu, cycles: usize) {
+            for _ in 0..cycles {
+                apu.clock_cpu_cycle();
+            }
+        }
+
+        #[test]
+        fn irq_first_asserts_at_29828_and_survives_sequence_wrap() {
+            let mut apu = Apu::new();
+            advance(&mut apu, 29_827);
+            assert!(!apu.irq_line());
+            apu.clock_cpu_cycle();
+            assert!(apu.irq_line());
+            advance(&mut apu, 100);
+            assert!(apu.irq_line(), "序列归零不能自动清除已挂起的 IRQ");
+            assert_eq!(apu.read_status() & 0x40, 0x40);
+            assert!(!apu.irq_line());
+            assert_eq!(apu.read_status() & 0x40, 0);
+        }
+
+        #[test]
+        fn terminal_cycles_can_reassert_irq_independently_of_block_ticks() {
+            let mut apu = Apu::new();
+            advance(&mut apu, 29_827);
+            for cycle in 29_828..=29_830 {
+                apu.clock_cpu_cycle();
+                assert!(apu.irq_line(), "cycle={cycle}");
+                // 本轮顺序调用约定：本次推进完成后，读取并确认该请求。
+                assert_eq!(apu.read_status() & 0x40, 0x40);
+                assert!(!apu.irq_line());
+            }
+            apu.clock_cpu_cycle();
+            assert!(!apu.irq_line());
+        }
+
+        #[test]
+        fn status_returns_old_irq_bit_without_clearing_channel_activity() {
+            let mut apu = Apu::new();
+            apu.write_register(0x4015, 3);
+            for base in [0x4000u16, 0x4004] {
+                apu.write_register(base, 0x3F); // 固定音量15，暂停长度递减。
+                apu.write_register(base + 2, 8);
+                apu.write_register(base + 3, 0); // 长度10。
+            }
+            advance(&mut apu, 29_831);
+            assert_eq!(apu.read_status(), 0x43);
+            assert_eq!(apu.read_status(), 0x03);
+            assert!(!apu.irq_line());
+        }
+
+        #[test]
+        fn writing_4015_does_not_acknowledge_frame_irq() {
+            let mut apu = Apu::new();
+            advance(&mut apu, 29_831);
+            apu.write_register(0x4015, 0);
+            assert!(apu.irq_line());
+            assert_eq!(apu.read_status() & 0x40, 0x40);
+        }
+
+        #[test]
+        fn inhibit_write_clears_irq_without_waiting_for_reset() {
+            let mut apu = Apu::new();
+            advance(&mut apu, 29_831);
+            assert!(apu.irq_line());
+            apu.write_register(0x4017, 0x40);
+            assert!(!apu.irq_line(), "bit6 应立即撤销 IRQ 请求");
+            advance(&mut apu, 60_000);
+            assert!(!apu.irq_line());
+            assert_eq!(apu.read_status() & 0x40, 0);
+        }
+
+        #[test]
+        fn writing_bit6_clear_does_not_clear_an_existing_irq() {
+            for value in [0x00, 0x80] {
+                let mut apu = Apu::new();
+                advance(&mut apu, 29_831);
+                apu.write_register(0x4017, value);
+                assert!(apu.irq_line());
+                advance(&mut apu, 4);
+                assert!(
+                    apu.irq_line(),
+                    "value={value:#04X}，重置/切换模式不确认旧 IRQ"
+                );
+            }
+        }
+
+        #[test]
+        fn five_step_mode_does_not_generate_new_frame_irqs() {
+            let mut apu = Apu::new();
+            apu.write_register(0x4017, 0x80);
+            for cycle in 1..=100_000 {
+                apu.clock_cpu_cycle();
+                assert!(!apu.irq_line(), "cycle={cycle}");
+            }
+        }
+
+        fn make_nes() -> Nes {
+            let mut rom = vec![0u8; 16 + 0x4000];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+            let prg = &mut rom[16..];
+            // $8000: CLI; $8001: JMP $8001。
+            prg[..4].copy_from_slice(&[0x58, 0x4C, 0x01, 0x80]);
+            // $9000: LDA $4015; INC $10; RTI。
+            prg[0x1000..0x1006].copy_from_slice(&[0xAD, 0x15, 0x40, 0xE6, 0x10, 0x40]);
+            prg[0x3FFC..0x3FFE].copy_from_slice(&0x8000u16.to_le_bytes());
+            prg[0x3FFE..0x4000].copy_from_slice(&0x9000u16.to_le_bytes());
+            let mut bus = Bus::new();
+            bus.insert_cartridge(Cartridge::try_from(rom.as_slice()).unwrap());
+            let mut cpu = Cpu::new();
+            cpu.reset(&mut bus).unwrap();
+            Nes::new(cpu, bus)
+        }
+
+        #[test]
+        fn nes_services_and_acknowledges_apu_irq_without_reentering() {
+            let mut nes = make_nes();
+            assert_eq!(nes.step().unwrap(), 2); // CLI。
+            assert_eq!(nes.step().unwrap(), 3); // CLI 后允许继续的一条指令。
+            for _ in 0..29_826 {
+                nes.clock_one_cpu_cycle().unwrap();
+            }
+            assert_eq!(nes.cpu_cycles(), 29_831);
+            assert!(nes.bus.irq_line());
+            assert_eq!(nes.step().unwrap(), 7); // IRQ 入口，不是执行处理程序。
+            assert!(nes.bus.irq_line(), "CPU 进入 IRQ 不能替 APU 确认请求");
+            assert_eq!(nes.step().unwrap(), 4); // LDA $4015。
+            assert!(!nes.bus.irq_line());
+            assert_eq!(nes.step().unwrap(), 5); // INC $10。
+            assert_eq!(nes.bus.cpu_read(0x10).unwrap(), 1);
+            assert_eq!(nes.step().unwrap(), 6); // RTI。
+            assert_eq!(nes.step().unwrap(), 3); // 恢复 JMP，而不是再次进入 IRQ。
+        }
+
+        #[test]
+        fn cpu_i_flag_blocks_entry_but_does_not_erase_apu_request() {
+            let mut nes = make_nes(); // reset 后 I=1。
+            for _ in 0..29_831 {
+                nes.clock_one_cpu_cycle().unwrap();
+            }
+            assert!(nes.bus.irq_line());
+            assert_eq!(nes.step().unwrap(), 2); // 仍执行 CLI，而非 IRQ 入口。
+            assert_eq!(nes.step().unwrap(), 3); // CLI 的旧 I 采样。
+            assert!(nes.bus.irq_line());
+            assert_eq!(nes.step().unwrap(), 7); // 随后才进入 IRQ。
         }
     }
 }

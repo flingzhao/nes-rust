@@ -10,6 +10,8 @@ pub(super) struct FrameCounter {
     five_step: bool,
     pending_reset: Option<(bool, u8)>,
     block_ticks: u8,
+    irq_inhibit: bool, // 是否禁止产生 frame IRQ 请求
+    frame_irq: bool,   // 是否存在尚未确认的
 }
 
 impl FrameCounter {
@@ -20,7 +22,16 @@ impl FrameCounter {
             five_step: false,
             pending_reset: None,
             block_ticks: 0,
+            irq_inhibit: false,
+            frame_irq: false,
         }
+    }
+
+    pub(super) fn irq_line(&self) -> bool {
+        self.frame_irq
+    }
+    pub(super) fn clear_frame_irq(&mut self) {
+        self.frame_irq = false;
     }
 
     pub(super) fn write_register(&mut self, value: u8) {
@@ -32,30 +43,26 @@ impl FrameCounter {
 
         // 四步、五步都需要重置；新请求覆盖尚未完成的旧请求。
         self.pending_reset = Some((five_step, delay));
+
+        self.irq_inhibit = value & 0x40 != 0;
+        if value & 0x40 != 0 {
+            self.clear_frame_irq();
+        }
     }
 
     // 每次调用代表经过一个 CPU 周期。
-    // pub(super) fn clock_cpu_cycle(&mut self) -> FrameEvents {
-    //     self.cycle += 1;
-    //     self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
-
-    //     let (half, quarter) = match self.cycle {
-    //         7457 => (false, true),
-    //         14913 => (true, true),
-    //         22371 => (false, true),
-    //         29829 => (true, true),
-    //         _ => (false, false),
-    //     };
-    //     if self.cycle == 29830 {
-    //         self.cycle = 0;
-    //     }
-
-    //     self.block_ticks = self.block_ticks.saturating_sub(1);
-    //     FrameEvents { half, quarter }
-    // }
     pub(super) fn clock_cpu_cycle(&mut self) -> FrameEvents {
         self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
         self.cycle += 1;
+
+        if !self.five_step && !self.irq_inhibit {
+            match self.cycle {
+                29828 | 29829 | 29830 => {
+                    self.frame_irq = true;
+                }
+                _ => {}
+            }
+        }
 
         // 一、按当前已经生效的模式，判断正常更新事件。
         let scheduled = match (self.five_step, self.cycle) {

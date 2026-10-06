@@ -151,6 +151,10 @@ impl Bus {
             controller.release_all();
         }
     }
+
+    pub fn irq_line(&self) -> bool {
+        self.apu.irq_line()
+    }
 }
 
 #[cfg(test)]
