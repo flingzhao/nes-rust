@@ -30,8 +30,11 @@ impl Apu {
                 self.pulses[0].set_enabled(value & 0x01 != 0);
                 self.pulses[1].set_enabled(value & 0x02 != 0);
             }
-            0x4008..=0x4013 | 0x4017 => {
+            0x4008..=0x4013 => {
                 // TODO：其它声道和帧序列器。
+            }
+            0x4017 => {
+                self.frame_counter.write_register(value);
             }
             _ => {
                 // 不属于本接口处理的 APU 寄存器。
