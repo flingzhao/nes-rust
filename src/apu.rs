@@ -12,7 +12,7 @@ pub struct Apu {
 impl Apu {
     pub fn new() -> Self {
         Self {
-            pulses: std::array::from_fn(|_| PulseChannel::new()),
+            pulses: std::array::from_fn(|index| PulseChannel::new_with_channel(index == 0)),
             frame_counter: FrameCounter::new(),
         }
     }
