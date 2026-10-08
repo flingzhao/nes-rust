@@ -1,11 +1,14 @@
+pub mod dmc;
 pub mod frame_counter;
 pub mod noise;
 pub mod pulse;
 pub mod triangle;
 
+use dmc::DmcChannel;
 use frame_counter::FrameCounter;
 use noise::NoiseChannel;
 use pulse::PulseChannel;
+use sdl2::sys::register_t;
 use triangle::TriangleChannel;
 
 pub struct Apu {
@@ -13,6 +16,7 @@ pub struct Apu {
     frame_counter: FrameCounter,
     triangle: TriangleChannel,
     noise: NoiseChannel,
+    dmc: DmcChannel,
 }
 
 impl Apu {
@@ -22,6 +26,7 @@ impl Apu {
             frame_counter: FrameCounter::new(),
             triangle: TriangleChannel::new(),
             noise: NoiseChannel::new(),
+            dmc: DmcChannel::new(),
         }
     }
 
@@ -41,17 +46,16 @@ impl Apu {
                 self.noise.set_enabled(value & 0x08 != 0);
             }
             0x4008..=0x400B => {
-                let offset = addr - 0x4008;
-                let register = (offset % 4) as u8;
+                let register = (addr - 0x4008) as u8;
                 self.triangle.write_register(register, value);
             }
             0x400C..=0x400F => {
-                let offset = addr - 0x400C;
-                let register = (offset % 4) as u8;
+                let register = (addr - 0x400C) as u8;
                 self.noise.write_register(register, value);
             }
             0x4010..=0x4013 => {
-                // TODO：其它声道和帧序列器。
+                let register = (addr - 0x4010) as u8;
+                self.dmc.write_register(register, value);
             }
             0x4017 => {
                 self.frame_counter.write_register(value);
@@ -83,6 +87,7 @@ impl Apu {
         self.pulses[1].clock_cpu_cycle();
         self.triangle.clock_cpu_cycle();
         self.noise.clock_cpu_cycle();
+        self.dmc.clock_cpu_cycle();
 
         let events = self.frame_counter.clock_cpu_cycle();
 
@@ -131,5 +136,9 @@ impl Apu {
 
     pub fn noise_output(&self) -> u8 {
         self.noise.output()
+    }
+
+    pub fn dmc_output(&self) -> u8 {
+        self.dmc.output()
     }
 }
