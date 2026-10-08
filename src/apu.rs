@@ -1,12 +1,15 @@
 pub mod frame_counter;
 pub mod pulse;
+pub mod triangle;
 
 use frame_counter::FrameCounter;
 use pulse::PulseChannel;
+use triangle::TriangleChannel;
 
 pub struct Apu {
     pulses: [PulseChannel; 2],
     frame_counter: FrameCounter,
+    triangle: TriangleChannel,
 }
 
 impl Apu {
@@ -14,6 +17,7 @@ impl Apu {
         Self {
             pulses: std::array::from_fn(|index| PulseChannel::new_with_channel(index == 0)),
             frame_counter: FrameCounter::new(),
+            triangle: TriangleChannel::new(),
         }
     }
 
@@ -29,8 +33,14 @@ impl Apu {
             0x4015 => {
                 self.pulses[0].set_enabled(value & 0x01 != 0);
                 self.pulses[1].set_enabled(value & 0x02 != 0);
+                self.triangle.set_enabled(value & 0x04 != 0);
             }
-            0x4008..=0x4013 => {
+            0x4008..=0x400B => {
+                let offset = addr - 0x4008;
+                let register = (offset % 4) as u8;
+                self.triangle.write_register(register, value);
+            }
+            0x400C..=0x4013 => {
                 // TODO：其它声道和帧序列器。
             }
             0x4017 => {
@@ -51,34 +61,41 @@ impl Apu {
 
         self.frame_counter.clear_frame_irq();
 
-        irq_bit | pulse1 | (pulse2 << 1)
+        let triangle_bit = u8::from(self.triangle.is_active()) << 2;
+
+        irq_bit | triangle_bit | pulse1 | (pulse2 << 1)
     }
 
     pub fn clock_cpu_cycle(&mut self) {
         self.pulses[0].clock_cpu_cycle();
         self.pulses[1].clock_cpu_cycle();
+        self.triangle.clock_cpu_cycle();
 
         let events = self.frame_counter.clock_cpu_cycle();
 
         if events.half {
-            self.pulses[0].clock_half_frame();
-            self.pulses[1].clock_half_frame();
+            self.clock_half_frame();
+            // self.pulses[0].clock_half_frame();
+            // self.pulses[1].clock_half_frame();
         }
 
         if events.quarter {
-            self.pulses[0].clock_quarter_frame();
-            self.pulses[1].clock_quarter_frame();
+            self.clock_quarter_frame();
+            // self.pulses[0].clock_quarter_frame();
+            // self.pulses[1].clock_quarter_frame();
         }
     }
 
     pub fn clock_half_frame(&mut self) {
         self.pulses[0].clock_half_frame();
         self.pulses[1].clock_half_frame();
+        self.triangle.clock_half_frame();
     }
 
     pub fn clock_quarter_frame(&mut self) {
         self.pulses[0].clock_quarter_frame();
         self.pulses[1].clock_quarter_frame();
+        self.triangle.clock_quarter_frame();
     }
 
     // 返回两个声道各自的原始输出，不做混音。
@@ -91,5 +108,9 @@ impl Apu {
 
     pub fn irq_line(&self) -> bool {
         self.frame_counter.irq_line()
+    }
+
+    pub fn triangle_output(&self) -> u8 {
+        self.triangle.output()
     }
 }
