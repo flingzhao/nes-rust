@@ -8,7 +8,6 @@ use dmc::DmcChannel;
 use frame_counter::FrameCounter;
 use noise::NoiseChannel;
 use pulse::PulseChannel;
-use sdl2::sys::register_t;
 use triangle::TriangleChannel;
 
 pub struct Apu {
@@ -44,6 +43,7 @@ impl Apu {
                 self.pulses[1].set_enabled(value & 0x02 != 0);
                 self.triangle.set_enabled(value & 0x04 != 0);
                 self.noise.set_enabled(value & 0x08 != 0);
+                self.dmc.set_enabled(value & 0x10 != 0);
             }
             0x4008..=0x400B => {
                 let register = (addr - 0x4008) as u8;
@@ -69,9 +69,9 @@ impl Apu {
 
     pub fn read_status(&mut self) -> u8 {
         let pulse1 = u8::from(self.pulses[0].is_active());
-        let pulse2 = u8::from(self.pulses[1].is_active());
+        let pulse2 = u8::from(self.pulses[1].is_active()) << 1;
 
-        let irq_bit = u8::from(self.irq_line()) << 6;
+        let irq_bit = u8::from(self.frame_counter.irq_line()) << 6;
 
         self.frame_counter.clear_frame_irq();
 
@@ -79,7 +79,10 @@ impl Apu {
 
         let noise_bit = u8::from(self.noise.is_active()) << 3;
 
-        irq_bit | noise_bit | triangle_bit | pulse1 | (pulse2 << 1)
+        let dmc_active_bit = u8::from(self.dmc.is_active()) << 4;
+        let dmc_irq_bit = u8::from(self.dmc.irq_pending()) << 7;
+
+        dmc_irq_bit | irq_bit | dmc_active_bit | noise_bit | triangle_bit | pulse2 | pulse1
     }
 
     pub fn clock_cpu_cycle(&mut self) {
@@ -127,7 +130,7 @@ impl Apu {
     }
 
     pub fn irq_line(&self) -> bool {
-        self.frame_counter.irq_line()
+        self.frame_counter.irq_line() | self.dmc.irq_pending()
     }
 
     pub fn triangle_output(&self) -> u8 {
