@@ -204,21 +204,29 @@ mod tests {
     #[cfg(test)]
     mod silent_apu_tests {
         use super::*;
-
         #[test]
-        fn accepts_apu_writes_without_starting_dma() {
+        fn accepts_apu_writes_without_starting_oam_dma() {
             let mut bus = Bus::new();
 
+            // 此时其他四个声道尚未使能，长度写入不会装载长度计数器。
+            // DMC 的样本地址、样本长度配置仍然会保存。
             for addr in 0x4000u16..=0x4013 {
                 bus.cpu_write(addr, 0xFF).unwrap();
             }
+
+            // 启动 DMC，bytes_remaining 装载为 4081。
             bus.cpu_write(0x4015, 0x1F).unwrap();
             bus.cpu_write(0x4017, 0x40).unwrap();
 
-            assert_eq!(bus.cpu_read(0x4015).unwrap(), 0);
+            // 只有 DMC active（bit 4）为一。
+            assert_eq!(bus.cpu_read(0x4015).unwrap(), 0x10);
             assert_eq!(bus.take_oam_dma_request(), None);
 
-            // 确认新增分支没有吞掉 OAM DMA。
+            // 关闭 DMC 读取，active 位应清零。
+            bus.cpu_write(0x4015, 0x0F).unwrap();
+            assert_eq!(bus.cpu_read(0x4015).unwrap(), 0);
+
+            // APU 分支不能吞掉 $4014 的 OAM DMA 写入。
             bus.cpu_write(0x4014, 0x02).unwrap();
             assert_eq!(bus.take_oam_dma_request(), Some(0x02));
             assert_eq!(bus.take_oam_dma_request(), None);
