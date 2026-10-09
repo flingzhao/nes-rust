@@ -4,5 +4,6 @@ pub mod cartridge;
 pub mod controller;
 pub mod cpu;
 pub mod debug_video;
+pub(crate) mod dmc_dma;
 pub mod nes;
 pub mod ppu;
