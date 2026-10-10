@@ -1,4 +1,5 @@
 use crate::bus::Bus;
+use crate::cpu_bus::CpuBus;
 
 const FLAG_C: u8 = 0x01; // Carry
 const FLAG_Z: u8 = 0x02; // Zero
@@ -62,7 +63,7 @@ impl Cpu {
         self.set_flag(FLAG_N, is_negative);
     }
 
-    pub fn reset(&mut self, bus: &mut Bus) -> Result<(), String> {
+    pub fn reset(&mut self, bus: &mut impl CpuBus) -> Result<(), String> {
         let low = bus.cpu_read(0xFFFC)?;
         let high = bus.cpu_read(0xFFFD)?;
         self.pc = u16::from_le_bytes([low, high]);
@@ -75,19 +76,19 @@ impl Cpu {
         Ok(())
     }
 
-    fn fetch_byte(&mut self, bus: &mut Bus) -> Result<u8, String> {
+    fn fetch_byte(&mut self, bus: &mut impl CpuBus) -> Result<u8, String> {
         let value = bus.cpu_read(self.pc)?;
         self.pc = self.pc.wrapping_add(1);
         Ok(value)
     }
 
-    fn fetch_word(&mut self, bus: &mut Bus) -> Result<u16, String> {
+    fn fetch_word(&mut self, bus: &mut impl CpuBus) -> Result<u16, String> {
         let low = self.fetch_byte(bus)?;
         let high = self.fetch_byte(bus)?;
         Ok(u16::from_le_bytes([low, high]))
     }
 
-    fn branch(&mut self, bus: &mut Bus, condition: bool) -> Result<u8, String> {
+    fn branch(&mut self, bus: &mut impl CpuBus, condition: bool) -> Result<u8, String> {
         let offset = self.fetch_byte(bus)? as i8;
         if !condition {
             return Ok(2);
@@ -105,14 +106,14 @@ impl Cpu {
         }
     }
 
-    fn push_byte(&mut self, bus: &mut Bus, value: u8) -> Result<(), String> {
+    fn push_byte(&mut self, bus: &mut impl CpuBus, value: u8) -> Result<(), String> {
         let addr = u16::from(self.sp) | BASE_STACKPAGE;
         bus.cpu_write(addr, value)?;
         self.sp = self.sp.wrapping_sub(1u8);
         Ok(())
     }
 
-    fn pop_byte(&mut self, bus: &mut Bus) -> Result<u8, String> {
+    fn pop_byte(&mut self, bus: &mut impl CpuBus) -> Result<u8, String> {
         let next_sp = self.sp.wrapping_add(1);
         let addr = u16::from(next_sp) | BASE_STACKPAGE;
         let value = bus.cpu_read(addr)?;
@@ -210,21 +211,25 @@ impl Cpu {
         value
     }
 
-    fn fetch_absolute_indexed(&mut self, bus: &mut Bus, index: u8) -> Result<(u16, bool), String> {
+    fn fetch_absolute_indexed(
+        &mut self,
+        bus: &mut impl CpuBus,
+        index: u8,
+    ) -> Result<(u16, bool), String> {
         let base = self.fetch_word(bus)?;
         let addr = base.wrapping_add(u16::from(index));
         let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
         Ok((addr, crossed_page))
     }
 
-    fn read_zero_page_word(&self, bus: &mut Bus, pointer: u8) -> Result<u16, String> {
+    fn read_zero_page_word(&self, bus: &mut impl CpuBus, pointer: u8) -> Result<u16, String> {
         let low = bus.cpu_read(pointer as u16)?;
         let high = bus.cpu_read(pointer.wrapping_add(1) as u16)?;
         let addr = u16::from_le_bytes([low, high]);
         Ok(addr)
     }
 
-    fn read_jmp_indirect_target(&self, bus: &mut Bus, pointer: u16) -> Result<u16, String> {
+    fn read_jmp_indirect_target(&self, bus: &mut impl CpuBus, pointer: u16) -> Result<u16, String> {
         let low = bus.cpu_read(pointer)?;
         let high = bus.cpu_read((pointer & 0xFF00) | (pointer.wrapping_add(1) & 0x00FF))?;
         let addr = u16::from_le_bytes([low, high]);
@@ -233,7 +238,7 @@ impl Cpu {
 
     // 公共入口动作：压栈、设置 I、读取向量。
     // vector 只由内部传入 0xFFFA 或 0xFFFE。
-    fn enter_interrupt(&mut self, bus: &mut Bus, vector: u16) -> Result<u8, String> {
+    fn enter_interrupt(&mut self, bus: &mut impl CpuBus, vector: u16) -> Result<u8, String> {
         self.push_byte(bus, (self.pc >> 8) as u8)?;
         self.push_byte(bus, (self.pc & 0x00FF) as u8)?;
         let stacked_status = (self.status & !0x10) | 0x20;
@@ -246,11 +251,11 @@ impl Cpu {
         Ok(7)
     }
 
-    pub fn nmi(&mut self, bus: &mut Bus) -> Result<u8, String> {
+    pub fn nmi(&mut self, bus: &mut impl CpuBus) -> Result<u8, String> {
         self.enter_interrupt(bus, 0xFFFA)
     }
 
-    pub fn irq(&mut self, bus: &mut Bus) -> Result<u8, String> {
+    pub fn irq(&mut self, bus: &mut impl CpuBus) -> Result<u8, String> {
         if self.flag(FLAG_I) {
             return Ok(0);
         }
@@ -270,7 +275,7 @@ impl Cpu {
         self.irq_line = asserted;
     }
 
-    pub fn step(&mut self, bus: &mut Bus) -> Result<u8, String> {
+    pub fn step(&mut self, bus: &mut impl CpuBus) -> Result<u8, String> {
         // 取出后自动重置为 false，只跳过一次。
         let skip_poll = std::mem::take(&mut self.skip_interrupt_poll);
 
@@ -1337,7 +1342,7 @@ mod tests {
         bus
     }
 
-    fn write_irq_test_program(bus: &mut Bus, program: &[u8]) {
+    fn write_irq_test_program(bus: &mut impl CpuBus, program: &[u8]) {
         for (offset, &byte) in program.iter().enumerate() {
             bus.cpu_write(0x0200 + offset as u16, byte).unwrap();
         }
@@ -4300,5 +4305,191 @@ mod tests {
                 assert!(cpu.flag(FLAG_I));
             }
         }
+    }
+}
+
+// Paste this module at the end of src/cpu.rs.
+// These tests record accesses performed by the CPU implementation.
+// They do not establish cycle accuracy for all 6502 instructions.
+#[cfg(test)]
+mod cpu_bus_tests {
+    use super::{Cpu, FLAG_N, FLAG_Z};
+    use crate::bus::Bus;
+    use crate::cpu_bus::CpuBus;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Access {
+        Read(u16),
+        Write(u16, u8),
+    }
+
+    struct TraceBus {
+        memory: Vec<u8>,
+        accesses: Vec<Access>,
+        fail_read: Option<u16>,
+        fail_write: Option<u16>,
+    }
+
+    impl TraceBus {
+        fn with_program(program: &[u8]) -> Self {
+            let mut memory = vec![0; 65536];
+            memory[0x8000..0x8000 + program.len()].copy_from_slice(program);
+            Self {
+                memory,
+                accesses: Vec::new(),
+                fail_read: None,
+                fail_write: None,
+            }
+        }
+    }
+
+    impl CpuBus for TraceBus {
+        fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
+            self.accesses.push(Access::Read(addr));
+            if self.fail_read == Some(addr) {
+                return Err(format!("test read failure at {addr:04X}"));
+            }
+            Ok(self.memory[usize::from(addr)])
+        }
+
+        fn cpu_write(&mut self, addr: u16, value: u8) -> Result<(), String> {
+            self.accesses.push(Access::Write(addr, value));
+            if self.fail_write == Some(addr) {
+                return Err(format!("test write failure at {addr:04X}"));
+            }
+            self.memory[usize::from(addr)] = value;
+            Ok(())
+        }
+    }
+
+    fn cpu_at_start() -> Cpu {
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x8000;
+        cpu
+    }
+
+    #[test]
+    fn lda_immediate_uses_supplied_bus() {
+        let mut cpu = cpu_at_start();
+        let mut bus = TraceBus::with_program(&[0xA9, 0x80]);
+        assert_eq!(cpu.step(&mut bus).unwrap(), 2);
+        assert_eq!(cpu.a, 0x80);
+        assert_eq!(cpu.pc, 0x8002);
+        assert!(cpu.flag(FLAG_N));
+        assert!(!cpu.flag(FLAG_Z));
+        assert_eq!(
+            bus.accesses,
+            vec![Access::Read(0x8000), Access::Read(0x8001)]
+        );
+    }
+
+    #[test]
+    fn lda_absolute_preserves_read_order() {
+        let mut cpu = cpu_at_start();
+        let mut bus = TraceBus::with_program(&[0xAD, 0x00, 0x02]);
+        bus.memory[0x0200] = 0x40;
+        assert_eq!(cpu.step(&mut bus).unwrap(), 4);
+        assert_eq!(cpu.a, 0x40);
+        assert_eq!(cpu.pc, 0x8003);
+        assert_eq!(
+            bus.accesses,
+            vec![
+                Access::Read(0x8000),
+                Access::Read(0x8001),
+                Access::Read(0x8002),
+                Access::Read(0x0200),
+            ]
+        );
+    }
+
+    #[test]
+    fn sta_absolute_preserves_flags_and_write_order() {
+        let mut cpu = cpu_at_start();
+        let mut bus = TraceBus::with_program(&[0x8D, 0x00, 0x02]);
+        cpu.a = 0x80;
+        let status_before = cpu.status;
+        assert_eq!(cpu.step(&mut bus).unwrap(), 4);
+        assert_eq!(cpu.pc, 0x8003);
+        assert_eq!(cpu.status, status_before);
+        assert_eq!(bus.memory[0x0200], 0x80);
+        assert_eq!(
+            bus.accesses,
+            vec![
+                Access::Read(0x8000),
+                Access::Read(0x8001),
+                Access::Read(0x8002),
+                Access::Write(0x0200, 0x80),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_store_load_chain_keeps_result_and_cycles() {
+        let mut cpu = cpu_at_start();
+        let mut bus = TraceBus::with_program(&[0xA9, 0x80, 0x8D, 0x00, 0x02, 0xAD, 0x00, 0x02]);
+        let mut cycles = 0u64;
+        for _ in 0..3 {
+            cycles += u64::from(cpu.step(&mut bus).unwrap());
+        }
+        assert_eq!(cycles, 10);
+        assert_eq!(cpu.a, 0x80);
+        assert_eq!(cpu.pc, 0x8008);
+        assert_eq!(bus.memory[0x0200], 0x80);
+        assert_eq!(
+            bus.accesses,
+            vec![
+                Access::Read(0x8000),
+                Access::Read(0x8001),
+                Access::Read(0x8002),
+                Access::Read(0x8003),
+                Access::Read(0x8004),
+                Access::Write(0x0200, 0x80),
+                Access::Read(0x8005),
+                Access::Read(0x8006),
+                Access::Read(0x8007),
+                Access::Read(0x0200),
+            ]
+        );
+    }
+
+    #[test]
+    fn opcode_read_error_reaches_caller() {
+        let mut cpu = cpu_at_start();
+        let mut bus = TraceBus::with_program(&[0xA9, 0x80]);
+        bus.fail_read = Some(0x8000);
+        let error = cpu.step(&mut bus).unwrap_err();
+        assert!(error.contains("test read failure at 8000"), "{error}");
+        assert_eq!(bus.accesses, vec![Access::Read(0x8000)]);
+    }
+
+    #[test]
+    fn operand_read_error_reaches_caller() {
+        let mut cpu = cpu_at_start();
+        let mut bus = TraceBus::with_program(&[0xAD, 0x00, 0x02]);
+        cpu.a = 0x55;
+        bus.fail_read = Some(0x0200);
+        let error = cpu.step(&mut bus).unwrap_err();
+        assert!(error.contains("test read failure at 0200"), "{error}");
+        assert_eq!(cpu.a, 0x55);
+    }
+
+    #[test]
+    fn data_write_error_reaches_caller() {
+        let mut cpu = cpu_at_start();
+        let mut bus = TraceBus::with_program(&[0x8D, 0x00, 0x02]);
+        cpu.a = 0x80;
+        bus.fail_write = Some(0x0200);
+        let error = cpu.step(&mut bus).unwrap_err();
+        assert!(error.contains("test write failure at 0200"), "{error}");
+        assert_eq!(bus.memory[0x0200], 0);
+    }
+
+    #[test]
+    fn real_bus_trait_forwarding_preserves_ram_mirroring() {
+        let mut bus = Bus::new();
+        CpuBus::cpu_write(&mut bus, 0x0002, 0xA5).unwrap();
+        assert_eq!(CpuBus::cpu_read(&mut bus, 0x0802).unwrap(), 0xA5);
+        CpuBus::cpu_write(&mut bus, 0x1002, 0x3C).unwrap();
+        assert_eq!(CpuBus::cpu_read(&mut bus, 0x0002).unwrap(), 0x3C);
     }
 }

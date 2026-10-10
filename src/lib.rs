@@ -3,6 +3,7 @@ pub mod bus;
 pub mod cartridge;
 pub mod controller;
 pub mod cpu;
+pub mod cpu_bus;
 pub mod debug_video;
 pub(crate) mod dmc_dma;
 pub mod nes;
