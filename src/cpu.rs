@@ -64,10 +64,19 @@ impl Cpu {
     }
 
     pub fn reset(&mut self, bus: &mut impl CpuBus) -> Result<(), String> {
+        let _ = bus.cpu_read(self.pc)?;
+        let _ = bus.cpu_read(self.pc)?;
+
+        let mut sp = self.sp;
+        for _ in 0..3 {
+            let _ = bus.cpu_read(0x100 | u16::from(sp))?;
+            sp = sp.wrapping_sub(1);
+        }
         let low = bus.cpu_read(0xFFFC)?;
         let high = bus.cpu_read(0xFFFD)?;
+
+        self.sp = sp;
         self.pc = u16::from_le_bytes([low, high]);
-        self.sp = self.sp.wrapping_sub(3);
 
         self.set_flag(FLAG_I, true);
         self.irq_mask_override = None;
@@ -97,13 +106,14 @@ impl Cpu {
         let target = base.wrapping_add_signed(i16::from(offset));
 
         let crossed_page = (base & 0xFF00) != (target & 0xFF00);
+        let _ = bus.cpu_read(base)?;
+        if crossed_page {
+            let dummy_addr = (base & 0xFF00) | (target & 0x00FF);
+            let _ = bus.cpu_read(dummy_addr)?;
+        }
         self.pc = target;
 
-        if !crossed_page {
-            return Ok(3);
-        } else {
-            return Ok(4);
-        }
+        if !crossed_page { Ok(3) } else { Ok(4) }
     }
 
     fn push_byte(&mut self, bus: &mut impl CpuBus, value: u8) -> Result<(), String> {
@@ -215,11 +225,23 @@ impl Cpu {
         &mut self,
         bus: &mut impl CpuBus,
         index: u8,
+        always_dummy_read: bool,
     ) -> Result<(u16, bool), String> {
         let base = self.fetch_word(bus)?;
         let addr = base.wrapping_add(u16::from(index));
         let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+        if crossed_page || always_dummy_read {
+            let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+            let _ = bus.cpu_read(dummy_addr)?;
+        }
+
         Ok((addr, crossed_page))
+    }
+
+    fn fetch_zero_page_indexed(&mut self, bus: &mut impl CpuBus, index: u8) -> Result<u16, String> {
+        let base = self.fetch_byte(bus)?;
+        let _ = bus.cpu_read(u16::from(base))?;
+        Ok(u16::from(base.wrapping_add(index)))
     }
 
     fn read_zero_page_word(&self, bus: &mut impl CpuBus, pointer: u8) -> Result<u16, String> {
@@ -239,6 +261,8 @@ impl Cpu {
     // 公共入口动作：压栈、设置 I、读取向量。
     // vector 只由内部传入 0xFFFA 或 0xFFFE。
     fn enter_interrupt(&mut self, bus: &mut impl CpuBus, vector: u16) -> Result<u8, String> {
+        let _ = bus.cpu_read(self.pc)?;
+        let _ = bus.cpu_read(self.pc)?;
         self.push_byte(bus, (self.pc >> 8) as u8)?;
         self.push_byte(bus, (self.pc & 0x00FF) as u8)?;
         let stacked_status = (self.status & !0x10) | 0x20;
@@ -323,6 +347,7 @@ impl Cpu {
                 Ok(2)
             }
             0xAA => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.x = self.a;
                 self.update_zero_negative(self.x);
                 Ok(2)
@@ -334,6 +359,7 @@ impl Cpu {
                 Ok(4)
             }
             0xE8 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.x = self.x.wrapping_add(1);
                 self.update_zero_negative(self.x);
                 Ok(2)
@@ -354,35 +380,47 @@ impl Cpu {
                 Ok(3)
             }
             0x48 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.push_byte(bus, self.a)?;
                 Ok(3)
             }
             0x68 => {
+                let _ = bus.cpu_read(self.pc)?;
+                let _ = bus.cpu_read(0x0100 | u16::from(self.sp))?;
                 self.a = self.pop_byte(bus)?;
                 self.update_zero_negative(self.a);
                 Ok(4)
             }
             0x20 => {
-                let dst = self.fetch_word(bus)?;
-                let ret_addr = self.pc.wrapping_sub(1);
+                let target_low = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(0x0100 | u16::from(self.sp))?;
 
+                let ret_addr = self.pc;
                 let [low, high] = ret_addr.to_le_bytes();
                 self.push_byte(bus, high)?;
                 self.push_byte(bus, low)?;
-                self.pc = dst;
+
+                let target_high = self.fetch_byte(bus)?;
+                self.pc = u16::from_le_bytes([target_low, target_high]);
                 Ok(6)
             }
             0x60 => {
+                let _ = bus.cpu_read(self.pc)?;
+                let _ = bus.cpu_read(0x0100 | u16::from(self.sp))?;
                 let low = self.pop_byte(bus)?;
                 let high = self.pop_byte(bus)?;
-                self.pc = u16::from_le_bytes([low, high]).wrapping_add(1);
+                let ret_addr = u16::from_le_bytes([low, high]);
+                let _ = bus.cpu_read(ret_addr)?;
+                self.pc = ret_addr.wrapping_add(1);
                 Ok(6)
             }
             0x18 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.set_flag(FLAG_C, false);
                 Ok(2)
             }
             0x38 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.set_flag(FLAG_C, true);
                 Ok(2)
             }
@@ -424,40 +462,48 @@ impl Cpu {
                 Ok(2)
             }
             0xA8 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.y = self.a;
                 self.update_zero_negative(self.y);
                 Ok(2)
             }
             0x8A => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.a = self.x;
                 self.update_zero_negative(self.a);
                 Ok(2)
             }
             0x98 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.a = self.y;
                 self.update_zero_negative(self.a);
                 Ok(2)
             }
             0xBA => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.x = self.sp;
                 self.update_zero_negative(self.x);
                 Ok(2)
             }
             0x9A => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.sp = self.x;
                 Ok(2)
             }
             0xCA => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.x = self.x.wrapping_sub(1);
                 self.update_zero_negative(self.x);
                 Ok(2)
             }
             0xC8 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.y = self.y.wrapping_add(1);
                 self.update_zero_negative(self.y);
                 Ok(2)
             }
             0x88 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.y = self.y.wrapping_sub(1);
                 self.update_zero_negative(self.y);
                 Ok(2)
@@ -493,18 +539,22 @@ impl Cpu {
                 Ok(4)
             }
             0x0A => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.a = self.asl(self.a);
                 Ok(2)
             }
-            0x4A => {
-                self.a = self.lsr(self.a);
-                Ok(2)
-            }
             0x2A => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.a = self.rol(self.a);
                 Ok(2)
             }
+            0x4A => {
+                let _ = bus.cpu_read(self.pc)?;
+                self.a = self.lsr(self.a);
+                Ok(2)
+            }
             0x6A => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.a = self.ror(self.a);
                 Ok(2)
             }
@@ -606,96 +656,104 @@ impl Cpu {
             }
             0xB5 => {
                 // LDA zero page,X
-                let base = self.fetch_byte(bus)?;
-                let addr = u16::from(base.wrapping_add(self.x));
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 self.a = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.a);
                 Ok(4)
             }
             0x95 => {
                 // STA zero page,X
-                let base = self.fetch_byte(bus)?;
-                let addr = u16::from(base.wrapping_add(self.x));
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 bus.cpu_write(addr, self.a)?;
                 Ok(4)
             }
             0xB6 => {
                 // LDX zero page,Y
-                let base = self.fetch_byte(bus)?;
-                let addr = u16::from(base.wrapping_add(self.y));
+                let addr = self.fetch_zero_page_indexed(bus, self.y)?;
                 self.x = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.x);
                 Ok(4)
             }
             0x96 => {
                 // STX zero page,Y
-                let base = self.fetch_byte(bus)?;
-                let addr = u16::from(base.wrapping_add(self.y));
+                let addr = self.fetch_zero_page_indexed(bus, self.y)?;
                 bus.cpu_write(addr, self.x)?;
                 Ok(4)
             }
             0xB4 => {
                 // LDY zero page,X
-                let base = self.fetch_byte(bus)?;
-                let addr = u16::from(base.wrapping_add(self.x));
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 self.y = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.y);
                 Ok(4)
             }
             0x94 => {
                 // STY zero page,X
-                let base = self.fetch_byte(bus)?;
-                let addr = u16::from(base.wrapping_add(self.x));
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 bus.cpu_write(addr, self.y)?;
                 Ok(4)
             }
             0xBD => {
-                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x)?;
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 self.a = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.a);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xB9 => {
-                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y)?;
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 self.a = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.a);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xBE => {
-                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y)?;
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 self.x = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.x);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xBC => {
-                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x)?;
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 self.y = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.y);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x9D => {
-                let (addr, _) = self.fetch_absolute_indexed(bus, self.x)?;
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x, true)?;
                 bus.cpu_write(addr, self.a)?;
                 Ok(5)
             }
             0x99 => {
-                let (addr, _) = self.fetch_absolute_indexed(bus, self.y)?;
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.y, true)?;
                 bus.cpu_write(addr, self.a)?;
                 Ok(5)
             }
+            0x81 => {
+                // STA ($nn, X)
+                let dummy_addr = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(dummy_addr))?;
+                let pointer = dummy_addr.wrapping_add(self.x);
+                let addr = self.read_zero_page_word(bus, pointer)?;
+                bus.cpu_write(addr, self.a)?;
+                Ok(6)
+            }
+            0x91 => {
+                // STA ($nn), Y
+                let pointer = self.fetch_byte(bus)?;
+                let base = self.read_zero_page_word(bus, pointer)?;
+                let addr = base.wrapping_add(self.y as u16);
+                let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                bus.cpu_read(dummy_addr)?;
+                bus.cpu_write(addr, self.a)?;
+                Ok(6)
+            }
             0xA1 => {
                 // LDA ($nn, X)
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let dummy_addr = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(dummy_addr))?;
+                let pointer = dummy_addr.wrapping_add(self.x);
                 let addr = self.read_zero_page_word(bus, pointer)?;
                 self.a = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.a);
-                Ok(6)
-            }
-            0x81 => {
-                // STA ($nn, X)
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
-                let addr = self.read_zero_page_word(bus, pointer)?;
-                bus.cpu_write(addr, self.a)?;
                 Ok(6)
             }
             0xB1 => {
@@ -703,18 +761,14 @@ impl Cpu {
                 let pointer = self.fetch_byte(bus)?;
                 let base = self.read_zero_page_word(bus, pointer)?;
                 let addr = base.wrapping_add(self.y as u16);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                if crossed_page {
+                    let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                    let _ = bus.cpu_read(dummy_addr)?;
+                }
                 self.a = bus.cpu_read(addr)?;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
-            }
-            0x91 => {
-                // STA ($nn), Y
-                let pointer = self.fetch_byte(bus)?;
-                let base = self.read_zero_page_word(bus, pointer)?;
-                let addr = base.wrapping_add(self.y as u16);
-                bus.cpu_write(addr, self.a)?;
-                Ok(6)
             }
             0xA6 => {
                 let addr = self.fetch_byte(bus)? as u16;
@@ -797,29 +851,27 @@ impl Cpu {
                 Ok(4)
             }
             0xD5 => {
-                let addr = u16::from(self.fetch_byte(bus)?.wrapping_add(self.x));
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let value = bus.cpu_read(addr)?;
                 self.compare_register(value, self.a);
                 Ok(4)
             }
             0xDD => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.x as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.compare_register(value, self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xD9 => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.y as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.compare_register(value, self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xC1 => {
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let base = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(base))?;
+                let pointer = base.wrapping_add(self.x);
                 let addr = self.read_zero_page_word(bus, pointer)?;
                 let value = bus.cpu_read(addr)?;
                 self.compare_register(value, self.a);
@@ -829,9 +881,13 @@ impl Cpu {
                 let pointer = self.fetch_byte(bus)?;
                 let base = self.read_zero_page_word(bus, pointer)?;
                 let addr = base.wrapping_add(self.y as u16);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                if crossed_page {
+                    let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                    bus.cpu_read(dummy_addr)?;
+                }
                 let value = bus.cpu_read(addr)?;
                 self.compare_register(value, self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
             0x65 => {
@@ -847,13 +903,13 @@ impl Cpu {
                 Ok(3)
             }
             0x75 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let value = bus.cpu_read(addr)?;
                 self.adc(value);
                 Ok(4)
             }
             0xF5 => {
-                let addr = u16::from(self.fetch_byte(bus)?.wrapping_add(self.x));
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let value = bus.cpu_read(addr)?;
                 self.sbc(value);
                 Ok(4)
@@ -871,23 +927,21 @@ impl Cpu {
                 Ok(4)
             }
             0x7D => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.x as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.adc(value);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x79 => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.y as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 let value = bus.cpu_read(addr)?;
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 self.adc(value);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x61 => {
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let dummy_addr = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(dummy_addr))?;
+                let pointer = dummy_addr.wrapping_add(self.x);
                 let addr = self.read_zero_page_word(bus, pointer)?;
                 let value = bus.cpu_read(addr)?;
                 self.adc(value);
@@ -897,29 +951,31 @@ impl Cpu {
                 let pointer = self.fetch_byte(bus)?;
                 let base = self.read_zero_page_word(bus, pointer)?;
                 let addr = base.wrapping_add(self.y as u16);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                if crossed_page {
+                    let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                    bus.cpu_read(dummy_addr)?;
+                }
                 let value = bus.cpu_read(addr)?;
                 self.adc(value);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
             0xFD => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.x as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.sbc(value);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xF9 => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.y as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 let value = bus.cpu_read(addr)?;
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 self.sbc(value);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0xE1 => {
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let base = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(base))?;
+                let pointer = base.wrapping_add(self.x);
                 let addr = self.read_zero_page_word(bus, pointer)?;
                 let value = bus.cpu_read(addr)?;
                 self.sbc(value);
@@ -929,9 +985,13 @@ impl Cpu {
                 let pointer = self.fetch_byte(bus)?;
                 let base = self.read_zero_page_word(bus, pointer)?;
                 let addr = base.wrapping_add(self.y as u16);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                if crossed_page {
+                    let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                    bus.cpu_read(dummy_addr)?;
+                }
                 let value = bus.cpu_read(addr)?;
                 self.sbc(value);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
             0x25 => {
@@ -942,7 +1002,7 @@ impl Cpu {
                 Ok(3)
             }
             0x35 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let value = bus.cpu_read(addr)?;
                 self.a &= value;
                 self.update_zero_negative(self.a);
@@ -956,25 +1016,23 @@ impl Cpu {
                 Ok(4)
             }
             0x3D => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.x as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.a &= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x39 => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.y as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.a &= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x21 => {
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let dummy_addr = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(dummy_addr))?;
+                let pointer = dummy_addr.wrapping_add(self.x);
                 let addr = self.read_zero_page_word(bus, pointer)?;
                 let value = bus.cpu_read(addr)?;
                 self.a &= value;
@@ -985,10 +1043,14 @@ impl Cpu {
                 let pointer = self.fetch_byte(bus)?;
                 let base = self.read_zero_page_word(bus, pointer)?;
                 let addr = base.wrapping_add(self.y as u16);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                if crossed_page {
+                    let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                    bus.cpu_read(dummy_addr)?;
+                }
                 let value = bus.cpu_read(addr)?;
                 self.a &= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
             0x05 => {
@@ -999,7 +1061,7 @@ impl Cpu {
                 Ok(3)
             }
             0x15 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let value = bus.cpu_read(addr)?;
                 self.a |= value;
                 self.update_zero_negative(self.a);
@@ -1013,25 +1075,23 @@ impl Cpu {
                 Ok(4)
             }
             0x1D => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.x as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.a |= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x19 => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.y as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.a |= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x01 => {
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let dummy_addr = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(dummy_addr))?;
+                let pointer = dummy_addr.wrapping_add(self.x);
                 let addr = self.read_zero_page_word(bus, pointer)?;
                 let value = bus.cpu_read(addr)?;
                 self.a |= value;
@@ -1042,10 +1102,14 @@ impl Cpu {
                 let pointer = self.fetch_byte(bus)?;
                 let base = self.read_zero_page_word(bus, pointer)?;
                 let addr = base.wrapping_add(self.y as u16);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                if crossed_page {
+                    let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                    bus.cpu_read(dummy_addr)?;
+                }
                 let value = bus.cpu_read(addr)?;
                 self.a |= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
             0x45 => {
@@ -1056,7 +1120,7 @@ impl Cpu {
                 Ok(3)
             }
             0x55 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let value = bus.cpu_read(addr)?;
                 self.a ^= value;
                 self.update_zero_negative(self.a);
@@ -1070,25 +1134,23 @@ impl Cpu {
                 Ok(4)
             }
             0x5D => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.x as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.x, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.a ^= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x59 => {
-                let base = self.fetch_word(bus)?;
-                let addr = base.wrapping_add(self.y as u16);
+                let (addr, crossed_page) = self.fetch_absolute_indexed(bus, self.y, false)?;
                 let value = bus.cpu_read(addr)?;
                 self.a ^= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 5 } else { 4 })
             }
             0x41 => {
-                let pointer = self.fetch_byte(bus)?.wrapping_add(self.x);
+                let dummy_addr = self.fetch_byte(bus)?;
+                let _ = bus.cpu_read(u16::from(dummy_addr))?;
+                let pointer = dummy_addr.wrapping_add(self.x);
                 let addr = self.read_zero_page_word(bus, pointer)?;
                 let value = bus.cpu_read(addr)?;
                 self.a ^= value;
@@ -1099,105 +1161,109 @@ impl Cpu {
                 let pointer = self.fetch_byte(bus)?;
                 let base = self.read_zero_page_word(bus, pointer)?;
                 let addr = base.wrapping_add(self.y as u16);
+                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
+                if crossed_page {
+                    let dummy_addr = (base & 0xFF00) | (addr & 0x00FF);
+                    bus.cpu_read(dummy_addr)?;
+                }
                 let value = bus.cpu_read(addr)?;
                 self.a ^= value;
                 self.update_zero_negative(self.a);
-                let crossed_page = (base & 0xFF00) != (addr & 0xFF00);
                 Ok(if crossed_page { 6 } else { 5 })
             }
             0x16 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.asl(old);
-                bus.cpu_write(addr, new)?;
-                Ok(6)
-            }
-            0x56 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let old = bus.cpu_read(addr)?;
-                bus.cpu_write(addr, old)?;
-                let new = self.lsr(old);
                 bus.cpu_write(addr, new)?;
                 Ok(6)
             }
             0x36 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.rol(old);
                 bus.cpu_write(addr, new)?;
                 Ok(6)
             }
+            0x56 => {
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.lsr(old);
+                bus.cpu_write(addr, new)?;
+                Ok(6)
+            }
             0x76 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.ror(old);
                 bus.cpu_write(addr, new)?;
                 Ok(6)
             }
-            0xF6 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
-                let old = bus.cpu_read(addr)?;
-                bus.cpu_write(addr, old)?;
-                let new = self.inc(old);
-                bus.cpu_write(addr, new)?;
-                Ok(6)
-            }
             0xD6 => {
-                let addr = self.fetch_byte(bus)?.wrapping_add(self.x) as u16;
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.dec(old);
                 bus.cpu_write(addr, new)?;
                 Ok(6)
             }
+            0xF6 => {
+                let addr = self.fetch_zero_page_indexed(bus, self.x)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.inc(old);
+                bus.cpu_write(addr, new)?;
+                Ok(6)
+            }
             0x1E => {
-                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x, true)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.asl(old);
                 bus.cpu_write(addr, new)?;
                 Ok(7)
             }
-            0x5E => {
-                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let old = bus.cpu_read(addr)?;
-                bus.cpu_write(addr, old)?;
-                let new = self.lsr(old);
-                bus.cpu_write(addr, new)?;
-                Ok(7)
-            }
             0x3E => {
-                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x, true)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.rol(old);
                 bus.cpu_write(addr, new)?;
                 Ok(7)
             }
+            0x5E => {
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x, true)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.lsr(old);
+                bus.cpu_write(addr, new)?;
+                Ok(7)
+            }
             0x7E => {
-                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x, true)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.ror(old);
                 bus.cpu_write(addr, new)?;
                 Ok(7)
             }
-            0xFE => {
-                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
-                let old = bus.cpu_read(addr)?;
-                bus.cpu_write(addr, old)?;
-                let new = self.inc(old);
-                bus.cpu_write(addr, new)?;
-                Ok(7)
-            }
             0xDE => {
-                let addr = self.fetch_word(bus)?.wrapping_add(self.x as u16);
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x, true)?;
                 let old = bus.cpu_read(addr)?;
                 bus.cpu_write(addr, old)?;
                 let new = self.dec(old);
+                bus.cpu_write(addr, new)?;
+                Ok(7)
+            }
+            0xFE => {
+                let (addr, _) = self.fetch_absolute_indexed(bus, self.x, true)?;
+                let old = bus.cpu_read(addr)?;
+                bus.cpu_write(addr, old)?;
+                let new = self.inc(old);
                 bus.cpu_write(addr, new)?;
                 Ok(7)
             }
@@ -1239,42 +1305,50 @@ impl Cpu {
 
             // CLD：清除十进制标志
             0xD8 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.set_flag(FLAG_D, false);
                 Ok(2)
             }
 
             // CLI：清除 IRQ 屏蔽标志
             0x58 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.set_flag(FLAG_I, false);
                 Ok(2)
             }
 
             // CLV：清除溢出标志
             0xB8 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.set_flag(FLAG_V, false);
                 Ok(2)
             }
 
             // SED：设置十进制标志
             0xF8 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.set_flag(FLAG_D, true);
                 Ok(2)
             }
 
             // SEI：设置 IRQ 屏蔽标志
             0x78 => {
+                let _ = bus.cpu_read(self.pc)?;
                 self.set_flag(FLAG_I, true);
                 Ok(2)
             }
             // PHP
             0x08 => {
                 // NV11DIZC
+                let _ = bus.cpu_read(self.pc)?;
                 let flags = self.status | 0x30;
                 self.push_byte(bus, flags)?;
                 Ok(3)
             }
             // PLP
             0x28 => {
+                let _ = bus.cpu_read(self.pc)?;
+                let _ = bus.cpu_read(0x0100 | u16::from(self.sp))?;
                 let flags = self.pop_byte(bus)? & 0xCF;
                 self.status = flags;
                 Ok(4)
@@ -1300,13 +1374,18 @@ impl Cpu {
             }
             // RTI
             0x40 => {
+                let _ = bus.cpu_read(self.pc)?;
+                let _ = bus.cpu_read(0x0100 | u16::from(self.sp))?;
                 self.status = self.pop_byte(bus)? & 0xCF;
                 let low = self.pop_byte(bus)?;
                 let high = self.pop_byte(bus)?;
                 self.pc = u16::from_le_bytes([low, high]);
                 Ok(6)
             }
-            0xEA => Ok(2),
+            0xEA => {
+                let _ = bus.cpu_read(self.pc)?;
+                Ok(2)
+            }
             _ => Err(format!(
                 "Unsupported opcode {opcode:#04X} at {instruction_pc:#06X}"
             )),
@@ -2613,7 +2692,7 @@ mod tests {
 
     #[test]
     fn absolute_indexed_address_wraps_at_ffff() {
-        let mut bus = Bus::new();
+        let mut bus = bus_with_reset_vector(0);
 
         // 程序放在 0200，避免与目标地址 0000 重叠。
         for (i, byte) in [0xBDu8, 0xFF, 0xFF].into_iter().enumerate() {
@@ -2723,7 +2802,7 @@ mod tests {
 
     #[test]
     fn indirect_indexed_y_wraps_final_sixteen_bit_address() {
-        let mut bus = Bus::new();
+        let mut bus = bus_with_reset_vector(0);
 
         bus.cpu_write(0x0300, 0xB1).unwrap(); // LDA ($40),Y
         bus.cpu_write(0x0301, 0x40).unwrap();
@@ -4491,5 +4570,3106 @@ mod cpu_bus_tests {
         assert_eq!(CpuBus::cpu_read(&mut bus, 0x0802).unwrap(), 0xA5);
         CpuBus::cpu_write(&mut bus, 0x1002, 0x3C).unwrap();
         assert_eq!(CpuBus::cpu_read(&mut bus, 0x0002).unwrap(), 0x3C);
+    }
+}
+#[cfg(test)]
+mod official_bus_sequence_tests {
+    use super::Cpu;
+    use crate::cpu_bus::CpuBus;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Access {
+        R(u16),
+        W(u16, u8),
+    }
+    use Access::{R, W};
+
+    struct TraceBus {
+        memory: Vec<u8>,
+        trace: Vec<Access>,
+    }
+    impl TraceBus {
+        fn new() -> Self {
+            Self {
+                memory: vec![0; 65536],
+                trace: Vec::new(),
+            }
+        }
+    }
+    impl CpuBus for TraceBus {
+        fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
+            self.trace.push(R(addr));
+            Ok(self.memory[usize::from(addr)])
+        }
+        fn cpu_write(&mut self, addr: u16, value: u8) -> Result<(), String> {
+            self.trace.push(W(addr, value));
+            self.memory[usize::from(addr)] = value;
+            Ok(())
+        }
+    }
+
+    struct Case {
+        name: &'static str,
+        program: &'static [u8],
+        pc: u16,
+        sp: u8,
+        status: u8,
+        ram: &'static [(u16, u8)],
+        expected: Vec<Access>,
+        cycles: u8,
+        next_pc: u16,
+    }
+
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "A9 immediate",
+                program: &[0xA9, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "A2 immediate",
+                program: &[0xA2, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "A0 immediate",
+                program: &[0xA0, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "09 immediate",
+                program: &[0x09, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "29 immediate",
+                program: &[0x29, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "49 immediate",
+                program: &[0x49, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "69 immediate",
+                program: &[0x69, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "E9 immediate",
+                program: &[0xE9, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "C9 immediate",
+                program: &[0xC9, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "E0 immediate",
+                program: &[0xE0, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "C0 immediate",
+                program: &[0xC0, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "A5 zero page",
+                program: &[0xA5, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "A6 zero page",
+                program: &[0xA6, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "A4 zero page",
+                program: &[0xA4, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "05 zero page",
+                program: &[0x05, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "25 zero page",
+                program: &[0x25, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "45 zero page",
+                program: &[0x45, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "65 zero page",
+                program: &[0x65, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "E5 zero page",
+                program: &[0xE5, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "C5 zero page",
+                program: &[0xC5, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "E4 zero page",
+                program: &[0xE4, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "C4 zero page",
+                program: &[0xC4, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "24 zero page",
+                program: &[0x24, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "AD absolute",
+                program: &[0xAD, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "AE absolute",
+                program: &[0xAE, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "AC absolute",
+                program: &[0xAC, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "0D absolute",
+                program: &[0x0D, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "2D absolute",
+                program: &[0x2D, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "4D absolute",
+                program: &[0x4D, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "6D absolute",
+                program: &[0x6D, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "ED absolute",
+                program: &[0xED, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "CD absolute",
+                program: &[0xCD, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "EC absolute",
+                program: &[0xEC, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "CC absolute",
+                program: &[0xCC, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "2C absolute",
+                program: &[0x2C, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "85 zero page store",
+                program: &[0x85, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), W(0x80, 0x55)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "86 zero page store",
+                program: &[0x86, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), W(0x80, 0x01)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "84 zero page store",
+                program: &[0x84, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), W(0x80, 0x01)],
+                cycles: 3,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "8D absolute store",
+                program: &[0x8D, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), W(0x0200, 0x55)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "8E absolute store",
+                program: &[0x8E, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), W(0x0200, 0x01)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "8C absolute store",
+                program: &[0x8C, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), W(0x0200, 0x01)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "B5 zp indexed base 80",
+                program: &[0xB5, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B5 zp indexed base FF",
+                program: &[0xB5, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B6 zp indexed base 80",
+                program: &[0xB6, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B6 zp indexed base FF",
+                program: &[0xB6, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B4 zp indexed base 80",
+                program: &[0xB4, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B4 zp indexed base FF",
+                program: &[0xB4, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "15 zp indexed base 80",
+                program: &[0x15, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "15 zp indexed base FF",
+                program: &[0x15, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "35 zp indexed base 80",
+                program: &[0x35, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "35 zp indexed base FF",
+                program: &[0x35, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "55 zp indexed base 80",
+                program: &[0x55, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "55 zp indexed base FF",
+                program: &[0x55, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "75 zp indexed base 80",
+                program: &[0x75, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "75 zp indexed base FF",
+                program: &[0x75, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "F5 zp indexed base 80",
+                program: &[0xF5, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "F5 zp indexed base FF",
+                program: &[0xF5, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "D5 zp indexed base 80",
+                program: &[0xD5, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x81, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), R(0x81)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "D5 zp indexed base FF",
+                program: &[0xD5, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "95 zp indexed store 80",
+                program: &[0x95, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x81, 0x55)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "95 zp indexed store FF",
+                program: &[0x95, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), W(0x00, 0x55)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "96 zp indexed store 80",
+                program: &[0x96, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x81, 0x01)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "96 zp indexed store FF",
+                program: &[0x96, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), W(0x00, 0x01)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "94 zp indexed store 80",
+                program: &[0x94, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x81, 0x01)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "94 zp indexed store FF",
+                program: &[0x94, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), W(0x00, 0x01)],
+                cycles: 4,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "BD abs indexed base 2F0",
+                program: &[0xBD, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BD abs indexed base 2FF",
+                program: &[0xBD, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BD abs indexed base FFFF",
+                program: &[0xBD, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "B9 abs indexed base 2F0",
+                program: &[0xB9, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "B9 abs indexed base 2FF",
+                program: &[0xB9, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "B9 abs indexed base FFFF",
+                program: &[0xB9, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BE abs indexed base 2F0",
+                program: &[0xBE, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BE abs indexed base 2FF",
+                program: &[0xBE, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BE abs indexed base FFFF",
+                program: &[0xBE, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BC abs indexed base 2F0",
+                program: &[0xBC, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BC abs indexed base 2FF",
+                program: &[0xBC, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "BC abs indexed base FFFF",
+                program: &[0xBC, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "1D abs indexed base 2F0",
+                program: &[0x1D, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "1D abs indexed base 2FF",
+                program: &[0x1D, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "1D abs indexed base FFFF",
+                program: &[0x1D, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "19 abs indexed base 2F0",
+                program: &[0x19, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "19 abs indexed base 2FF",
+                program: &[0x19, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "19 abs indexed base FFFF",
+                program: &[0x19, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "3D abs indexed base 2F0",
+                program: &[0x3D, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "3D abs indexed base 2FF",
+                program: &[0x3D, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "3D abs indexed base FFFF",
+                program: &[0x3D, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "39 abs indexed base 2F0",
+                program: &[0x39, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "39 abs indexed base 2FF",
+                program: &[0x39, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "39 abs indexed base FFFF",
+                program: &[0x39, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "5D abs indexed base 2F0",
+                program: &[0x5D, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "5D abs indexed base 2FF",
+                program: &[0x5D, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "5D abs indexed base FFFF",
+                program: &[0x5D, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "59 abs indexed base 2F0",
+                program: &[0x59, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "59 abs indexed base 2FF",
+                program: &[0x59, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "59 abs indexed base FFFF",
+                program: &[0x59, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "7D abs indexed base 2F0",
+                program: &[0x7D, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "7D abs indexed base 2FF",
+                program: &[0x7D, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "7D abs indexed base FFFF",
+                program: &[0x7D, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "79 abs indexed base 2F0",
+                program: &[0x79, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "79 abs indexed base 2FF",
+                program: &[0x79, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "79 abs indexed base FFFF",
+                program: &[0x79, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "FD abs indexed base 2F0",
+                program: &[0xFD, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "FD abs indexed base 2FF",
+                program: &[0xFD, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "FD abs indexed base FFFF",
+                program: &[0xFD, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "F9 abs indexed base 2F0",
+                program: &[0xF9, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "F9 abs indexed base 2FF",
+                program: &[0xF9, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "F9 abs indexed base FFFF",
+                program: &[0xF9, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "DD abs indexed base 2F0",
+                program: &[0xDD, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "DD abs indexed base 2FF",
+                program: &[0xDD, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "DD abs indexed base FFFF",
+                program: &[0xDD, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "D9 abs indexed base 2F0",
+                program: &[0xD9, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1)],
+                cycles: 4,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "D9 abs indexed base 2FF",
+                program: &[0xD9, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), R(0x0300)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "D9 abs indexed base FFFF",
+                program: &[0xD9, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), R(0x00)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "9D abs indexed base 2F0",
+                program: &[0x9D, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1), W(0x02F1, 0x55)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "9D abs indexed base 2FF",
+                program: &[0x9D, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), W(0x0300, 0x55)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "9D abs indexed base FFFF",
+                program: &[0x9D, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), W(0x00, 0x55)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "99 abs indexed base 2F0",
+                program: &[0x99, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02F1), W(0x02F1, 0x55)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "99 abs indexed base 2FF",
+                program: &[0x99, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x0200), W(0x0300, 0x55)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "99 abs indexed base FFFF",
+                program: &[0x99, 0xFF, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0xFF00), W(0x00, 0x55)],
+                cycles: 5,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "01 indirect X operand FE",
+                program: &[0x01, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFE), R(0xFF), R(0x00), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "01 indirect X operand FF",
+                program: &[0x01, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x01), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "21 indirect X operand FE",
+                program: &[0x21, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFE), R(0xFF), R(0x00), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "21 indirect X operand FF",
+                program: &[0x21, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x01), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "41 indirect X operand FE",
+                program: &[0x41, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFE), R(0xFF), R(0x00), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "41 indirect X operand FF",
+                program: &[0x41, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x01), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "61 indirect X operand FE",
+                program: &[0x61, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFE), R(0xFF), R(0x00), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "61 indirect X operand FF",
+                program: &[0x61, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x01), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "A1 indirect X operand FE",
+                program: &[0xA1, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFE), R(0xFF), R(0x00), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "A1 indirect X operand FF",
+                program: &[0xA1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x01), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "C1 indirect X operand FE",
+                program: &[0xC1, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFE), R(0xFF), R(0x00), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "C1 indirect X operand FF",
+                program: &[0xC1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x01), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "E1 indirect X operand FE",
+                program: &[0xE1, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFE), R(0xFF), R(0x00), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "E1 indirect X operand FF",
+                program: &[0xE1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x01), R(0x0200)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "81 indirect X operand FE",
+                program: &[0x81, 0xFE],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0x00), (0x00, 0x02), (0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFE),
+                    R(0xFF),
+                    R(0x00),
+                    W(0x0200, 0x55),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "81 indirect X operand FF",
+                program: &[0x81, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x00), (0x01, 0x02), (0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    R(0x01),
+                    W(0x0200, 0x55),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "11 indirect Y base 2F0",
+                program: &[0x11, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x02F1)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "11 indirect Y base 2FF",
+                program: &[0x11, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x0200), R(0x0300)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "31 indirect Y base 2F0",
+                program: &[0x31, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x02F1)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "31 indirect Y base 2FF",
+                program: &[0x31, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x0200), R(0x0300)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "51 indirect Y base 2F0",
+                program: &[0x51, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x02F1)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "51 indirect Y base 2FF",
+                program: &[0x51, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x0200), R(0x0300)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "71 indirect Y base 2F0",
+                program: &[0x71, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x02F1)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "71 indirect Y base 2FF",
+                program: &[0x71, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x0200), R(0x0300)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B1 indirect Y base 2F0",
+                program: &[0xB1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x02F1)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B1 indirect Y base 2FF",
+                program: &[0xB1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x0200), R(0x0300)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "D1 indirect Y base 2F0",
+                program: &[0xD1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x02F1)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "D1 indirect Y base 2FF",
+                program: &[0xD1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x0200), R(0x0300)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "F1 indirect Y base 2F0",
+                program: &[0xF1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x02F1)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "F1 indirect Y base 2FF",
+                program: &[0xF1, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0xFF), R(0x00), R(0x0200), R(0x0300)],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "91 indirect Y base 2F0",
+                program: &[0x91, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xF0), (0x00, 0x02), (0x02F1, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    R(0x02F1),
+                    W(0x02F1, 0x55),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "91 indirect Y base 2FF",
+                program: &[0x91, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFF, 0xFF), (0x00, 0x02), (0x0300, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    R(0x0200),
+                    W(0x0300, 0x55),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "06 ASL zp",
+                program: &[0x06, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x80, 0x81), W(0x80, 0x02)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "16 ASL zp X wrap",
+                program: &[0x16, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    W(0x00, 0x81),
+                    W(0x00, 0x02),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "0E ASL abs",
+                program: &[0x0E, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    W(0x0200, 0x81),
+                    W(0x0200, 0x02),
+                ],
+                cycles: 6,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "1E ASL abs X 2F0",
+                program: &[0x1E, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x02F1),
+                    R(0x02F1),
+                    W(0x02F1, 0x81),
+                    W(0x02F1, 0x02),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "1E ASL abs X 2FF",
+                program: &[0x1E, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    R(0x0300),
+                    W(0x0300, 0x81),
+                    W(0x0300, 0x02),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "26 ROL zp",
+                program: &[0x26, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x80, 0x81), W(0x80, 0x02)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "36 ROL zp X wrap",
+                program: &[0x36, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    W(0x00, 0x81),
+                    W(0x00, 0x02),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "2E ROL abs",
+                program: &[0x2E, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    W(0x0200, 0x81),
+                    W(0x0200, 0x02),
+                ],
+                cycles: 6,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "3E ROL abs X 2F0",
+                program: &[0x3E, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x02F1),
+                    R(0x02F1),
+                    W(0x02F1, 0x81),
+                    W(0x02F1, 0x02),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "3E ROL abs X 2FF",
+                program: &[0x3E, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    R(0x0300),
+                    W(0x0300, 0x81),
+                    W(0x0300, 0x02),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "46 LSR zp",
+                program: &[0x46, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x80, 0x81), W(0x80, 0x40)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "56 LSR zp X wrap",
+                program: &[0x56, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    W(0x00, 0x81),
+                    W(0x00, 0x40),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "4E LSR abs",
+                program: &[0x4E, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    W(0x0200, 0x81),
+                    W(0x0200, 0x40),
+                ],
+                cycles: 6,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "5E LSR abs X 2F0",
+                program: &[0x5E, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x02F1),
+                    R(0x02F1),
+                    W(0x02F1, 0x81),
+                    W(0x02F1, 0x40),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "5E LSR abs X 2FF",
+                program: &[0x5E, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    R(0x0300),
+                    W(0x0300, 0x81),
+                    W(0x0300, 0x40),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "66 ROR zp",
+                program: &[0x66, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x80, 0x81), W(0x80, 0x40)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "76 ROR zp X wrap",
+                program: &[0x76, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    W(0x00, 0x81),
+                    W(0x00, 0x40),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "6E ROR abs",
+                program: &[0x6E, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    W(0x0200, 0x81),
+                    W(0x0200, 0x40),
+                ],
+                cycles: 6,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "7E ROR abs X 2F0",
+                program: &[0x7E, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x02F1),
+                    R(0x02F1),
+                    W(0x02F1, 0x81),
+                    W(0x02F1, 0x40),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "7E ROR abs X 2FF",
+                program: &[0x7E, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    R(0x0300),
+                    W(0x0300, 0x81),
+                    W(0x0300, 0x40),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "C6 DEC zp",
+                program: &[0xC6, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x80, 0x81), W(0x80, 0x80)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "D6 DEC zp X wrap",
+                program: &[0xD6, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    W(0x00, 0x81),
+                    W(0x00, 0x80),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "CE DEC abs",
+                program: &[0xCE, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    W(0x0200, 0x81),
+                    W(0x0200, 0x80),
+                ],
+                cycles: 6,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "DE DEC abs X 2F0",
+                program: &[0xDE, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x02F1),
+                    R(0x02F1),
+                    W(0x02F1, 0x81),
+                    W(0x02F1, 0x80),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "DE DEC abs X 2FF",
+                program: &[0xDE, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    R(0x0300),
+                    W(0x0300, 0x81),
+                    W(0x0300, 0x80),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "E6 INC zp",
+                program: &[0xE6, 0x80],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x80, 0x81)],
+                expected: vec![R(0x8000), R(0x8001), R(0x80), W(0x80, 0x81), W(0x80, 0x82)],
+                cycles: 5,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "F6 INC zp X wrap",
+                program: &[0xF6, 0xFF],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x00, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0xFF),
+                    R(0x00),
+                    W(0x00, 0x81),
+                    W(0x00, 0x82),
+                ],
+                cycles: 6,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "EE INC abs",
+                program: &[0xEE, 0x00, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0200, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    W(0x0200, 0x81),
+                    W(0x0200, 0x82),
+                ],
+                cycles: 6,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "FE INC abs X 2F0",
+                program: &[0xFE, 0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02F1, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x02F1),
+                    R(0x02F1),
+                    W(0x02F1, 0x81),
+                    W(0x02F1, 0x82),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "FE INC abs X 2FF",
+                program: &[0xFE, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x0300, 0x81)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x8002),
+                    R(0x0200),
+                    R(0x0300),
+                    W(0x0300, 0x81),
+                    W(0x0300, 0x82),
+                ],
+                cycles: 7,
+                next_pc: 0x8003,
+            },
+            Case {
+                name: "AA implied or accumulator",
+                program: &[0xAA],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "A8 implied or accumulator",
+                program: &[0xA8],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "8A implied or accumulator",
+                program: &[0x8A],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "98 implied or accumulator",
+                program: &[0x98],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "BA implied or accumulator",
+                program: &[0xBA],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "9A implied or accumulator",
+                program: &[0x9A],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "E8 implied or accumulator",
+                program: &[0xE8],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "C8 implied or accumulator",
+                program: &[0xC8],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "CA implied or accumulator",
+                program: &[0xCA],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "88 implied or accumulator",
+                program: &[0x88],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "18 implied or accumulator",
+                program: &[0x18],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "38 implied or accumulator",
+                program: &[0x38],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "58 implied or accumulator",
+                program: &[0x58],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "78 implied or accumulator",
+                program: &[0x78],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "B8 implied or accumulator",
+                program: &[0xB8],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "D8 implied or accumulator",
+                program: &[0xD8],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "F8 implied or accumulator",
+                program: &[0xF8],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "EA implied or accumulator",
+                program: &[0xEA],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "0A implied or accumulator",
+                program: &[0x0A],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "2A implied or accumulator",
+                program: &[0x2A],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "4A implied or accumulator",
+                program: &[0x4A],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "6A implied or accumulator",
+                program: &[0x6A],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "10 branch not taken",
+                program: &[0x10, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0xA4,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "10 branch taken same page",
+                program: &[0x10, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "10 branch forward cross",
+                program: &[0x10, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "10 branch backward cross",
+                program: &[0x10, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "30 branch not taken",
+                program: &[0x30, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "30 branch taken same page",
+                program: &[0x30, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0xA4,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "30 branch forward cross",
+                program: &[0x30, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0xA4,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "30 branch backward cross",
+                program: &[0x30, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0xA4,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "50 branch not taken",
+                program: &[0x50, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x64,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "50 branch taken same page",
+                program: &[0x50, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "50 branch forward cross",
+                program: &[0x50, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "50 branch backward cross",
+                program: &[0x50, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "70 branch not taken",
+                program: &[0x70, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "70 branch taken same page",
+                program: &[0x70, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x64,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "70 branch forward cross",
+                program: &[0x70, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0x64,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "70 branch backward cross",
+                program: &[0x70, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0x64,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "90 branch not taken",
+                program: &[0x90, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x25,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "90 branch taken same page",
+                program: &[0x90, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "90 branch forward cross",
+                program: &[0x90, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "90 branch backward cross",
+                program: &[0x90, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "B0 branch not taken",
+                program: &[0xB0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "B0 branch taken same page",
+                program: &[0xB0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x25,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "B0 branch forward cross",
+                program: &[0xB0, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0x25,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "B0 branch backward cross",
+                program: &[0xB0, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0x25,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "D0 branch not taken",
+                program: &[0xD0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x26,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "D0 branch taken same page",
+                program: &[0xD0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "D0 branch forward cross",
+                program: &[0xD0, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "D0 branch backward cross",
+                program: &[0xD0, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "F0 branch not taken",
+                program: &[0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001)],
+                cycles: 2,
+                next_pc: 0x8002,
+            },
+            Case {
+                name: "F0 branch taken same page",
+                program: &[0xF0, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x26,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x8004,
+            },
+            Case {
+                name: "F0 branch forward cross",
+                program: &[0xF0, 0x01],
+                pc: 0x80FD,
+                sp: 0xFD,
+                status: 0x26,
+                ram: &[],
+                expected: vec![R(0x80FD), R(0x80FE), R(0x80FF), R(0x8000)],
+                cycles: 4,
+                next_pc: 0x8100,
+            },
+            Case {
+                name: "F0 branch backward cross",
+                program: &[0xF0, 0xFC],
+                pc: 0x8100,
+                sp: 0xFD,
+                status: 0x26,
+                ram: &[],
+                expected: vec![R(0x8100), R(0x8101), R(0x8102), R(0x81FE)],
+                cycles: 4,
+                next_pc: 0x80FE,
+            },
+            Case {
+                name: "48 PHA",
+                program: &[0x48],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), W(0x01FD, 0x55)],
+                cycles: 3,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "08 PHP",
+                program: &[0x08],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), W(0x01FD, 0x34)],
+                cycles: 3,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "68 PLA",
+                program: &[0x68],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x01FE, 0x80)],
+                expected: vec![R(0x8000), R(0x8001), R(0x01FD), R(0x01FE)],
+                cycles: 4,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "28 PLP",
+                program: &[0x28],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x01FE, 0x24)],
+                expected: vec![R(0x8000), R(0x8001), R(0x01FD), R(0x01FE)],
+                cycles: 4,
+                next_pc: 0x8001,
+            },
+            Case {
+                name: "20 JSR ordered high-byte fetch",
+                program: &[0x20, 0x34, 0x12],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x01FD),
+                    W(0x01FD, 0x80),
+                    W(0x01FC, 0x02),
+                    R(0x8002),
+                ],
+                cycles: 6,
+                next_pc: 0x1234,
+            },
+            Case {
+                name: "60 RTS reads unincremented return address",
+                program: &[0x60],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x01FE, 0x02), (0x01FF, 0x90)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x01FD),
+                    R(0x01FE),
+                    R(0x01FF),
+                    R(0x9002),
+                ],
+                cycles: 6,
+                next_pc: 0x9003,
+            },
+            Case {
+                name: "40 RTI stack wrap",
+                program: &[0x40],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x01FE, 0x24), (0x01FF, 0x00), (0x0100, 0x90)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    R(0x01FD),
+                    R(0x01FE),
+                    R(0x01FF),
+                    R(0x0100),
+                ],
+                cycles: 6,
+                next_pc: 0x9000,
+            },
+            Case {
+                name: "00 BRK exactly seven accesses",
+                program: &[0x00],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0xFFFE, 0x00), (0xFFFF, 0x90)],
+                expected: vec![
+                    R(0x8000),
+                    R(0x8001),
+                    W(0x01FD, 0x80),
+                    W(0x01FC, 0x02),
+                    W(0x01FB, 0x34),
+                    R(0xFFFE),
+                    R(0xFFFF),
+                ],
+                cycles: 7,
+                next_pc: 0x9000,
+            },
+            Case {
+                name: "4C JMP absolute",
+                program: &[0x4C, 0x00, 0x90],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002)],
+                cycles: 3,
+                next_pc: 0x9000,
+            },
+            Case {
+                name: "6C JMP indirect page-wrap quirk",
+                program: &[0x6C, 0xFF, 0x02],
+                pc: 0x8000,
+                sp: 0xFD,
+                status: 0x24,
+                ram: &[(0x02FF, 0x00), (0x0200, 0x90)],
+                expected: vec![R(0x8000), R(0x8001), R(0x8002), R(0x02FF), R(0x0200)],
+                cycles: 5,
+                next_pc: 0x9000,
+            },
+        ]
+    }
+
+    #[test]
+    fn all_official_opcodes_have_expected_bus_sequence() {
+        let cases = cases();
+        let mut covered = [false; 256];
+        let mut failures = Vec::new();
+        for case in cases {
+            covered[usize::from(case.program[0])] = true;
+            let mut cpu = Cpu::new();
+            cpu.pc = case.pc;
+            cpu.sp = case.sp;
+            cpu.status = case.status;
+            cpu.a = 0x55;
+            cpu.x = 1;
+            cpu.y = 1;
+            let mut bus = TraceBus::new();
+            for &(addr, value) in case.ram {
+                bus.memory[usize::from(addr)] = value;
+            }
+            for (offset, &value) in case.program.iter().enumerate() {
+                let addr = case.pc.wrapping_add(offset as u16);
+                bus.memory[usize::from(addr)] = value;
+            }
+            match cpu.step(&mut bus) {
+                Err(error) => failures.push(format!("{}: {error}", case.name)),
+                Ok(cycles) => {
+                    if cycles != case.cycles || cpu.pc != case.next_pc || bus.trace != case.expected
+                    {
+                        failures.push(format!(
+                            "{}\n cycles: got {}, expected {}\n PC: got {:04X}, expected {:04X}\n trace: got {:?}\n expected: {:?}",
+                            case.name, cycles, case.cycles, cpu.pc, case.next_pc,
+                            bus.trace, case.expected
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(covered.iter().filter(|&&v| v).count(), 151);
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    #[test]
+    fn hardware_interrupt_entries_read_pc_twice_before_pushing() {
+        for nmi in [false, true] {
+            let mut cpu = Cpu::new();
+            cpu.pc = 0x8000;
+            cpu.sp = 0xFD;
+            cpu.status = 0; // I clear: IRQ is allowed; stacked status must have bit 5.
+            let mut bus = TraceBus::new();
+            let vector = if nmi { 0xFFFA } else { 0xFFFE };
+            bus.memory[usize::from(vector)] = 0x34;
+            bus.memory[usize::from(vector + 1)] = 0x12;
+            let cycles = if nmi {
+                cpu.nmi(&mut bus)
+            } else {
+                cpu.irq(&mut bus)
+            }
+            .unwrap();
+            assert_eq!(cycles, 7);
+            assert_eq!(cpu.pc, 0x1234);
+            assert_eq!(cpu.sp, 0xFA);
+            assert_ne!(cpu.status & 0x04, 0);
+            assert_eq!(
+                bus.trace,
+                vec![
+                    R(0x8000),
+                    R(0x8000),
+                    W(0x01FD, 0x80),
+                    W(0x01FC, 0x00),
+                    W(0x01FB, 0x20),
+                    R(vector),
+                    R(vector + 1),
+                ],
+                "nmi={nmi}"
+            );
+        }
+    }
+
+    #[test]
+    fn masked_irq_performs_no_bus_access() {
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x8000;
+        cpu.sp = 0xFD;
+        cpu.status = 0x24;
+        let mut bus = TraceBus::new();
+        assert_eq!(cpu.irq(&mut bus).unwrap(), 0);
+        assert!(bus.trace.is_empty());
+        assert_eq!(cpu.pc, 0x8000);
+        assert_eq!(cpu.sp, 0xFD);
+    }
+
+    #[test]
+    fn reset_sequence_reads_stack_without_writing_it() {
+        // Models the normal seven-cycle reset sequence, not holding RESET active.
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x8000;
+        cpu.sp = 0xFD;
+        let mut bus = TraceBus::new();
+        bus.memory[0xFFFC] = 0x34;
+        bus.memory[0xFFFD] = 0x12;
+        cpu.reset(&mut bus).unwrap();
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cpu.sp, 0xFA);
+        assert_eq!(
+            bus.trace,
+            vec![
+                R(0x8000),
+                R(0x8000),
+                R(0x01FD),
+                R(0x01FC),
+                R(0x01FB),
+                R(0xFFFC),
+                R(0xFFFD),
+            ]
+        );
     }
 }
