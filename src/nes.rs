@@ -1,5 +1,5 @@
 use crate::controller::Button;
-use crate::{bus::Bus, cpu::Cpu};
+use crate::{bus::Bus, cpu::Cpu, cpu_bus::CpuBus};
 
 pub struct Nes {
     cpu: Cpu,
@@ -19,14 +19,27 @@ impl Nes {
     pub fn step(&mut self) -> Result<u8, String> {
         self.cpu.set_nmi_line(self.bus.ppu().nmi_line());
         self.cpu.set_irq_line(self.bus.irq_line());
-        let cycle = self.cpu.step(&mut self.bus)?;
-        for _ in 0..cycle {
-            self.clock_one_cpu_cycle()?;
+
+        let (result, nmi_levels) = {
+            let mut bus = ClockedCpuBus::new(&mut self.bus, &mut self.cpu_cycles);
+
+            let result = self.cpu.step(&mut bus);
+            let nmi_levels = bus.take_nmi_levels();
+
+            (result, nmi_levels)
+        };
+
+        // 适配器的借用已结束，现在可以更新 CPU 的信号。
+        for level in nmi_levels {
+            self.cpu.set_nmi_line(level);
         }
+        self.cpu.set_irq_line(self.bus.irq_line());
+
+        let cycles = result?;
 
         self.run_pending_oam_dma()?;
 
-        Ok(cycle)
+        Ok(cycles)
     }
 
     pub fn cpu_cycles(&self) -> u64 {
@@ -65,6 +78,8 @@ impl Nes {
     }
 
     fn clock_one_cpu_cycle(&mut self) -> Result<(), String> {
+        self.cpu.set_nmi_line(self.bus.ppu().nmi_line());
+
         let levels = self.bus.clock_cpu_cycle()?;
         // 在当前apu运行一个cpu周期后，更新irq
         self.cpu.set_irq_line(self.bus.irq_line());
@@ -105,6 +120,52 @@ impl Nes {
 
     pub fn release_all_buttons(&mut self) {
         self.bus.release_all_buttons();
+    }
+}
+
+struct ClockedCpuBus<'a> {
+    bus: &'a mut Bus,
+    cpu_cycles: &'a mut u64,
+    nmi_levels: Vec<bool>,
+}
+
+impl<'a> ClockedCpuBus<'a> {
+    fn new(bus: &'a mut Bus, cpu_cycles: &'a mut u64) -> Self {
+        Self {
+            bus,
+            cpu_cycles,
+            nmi_levels: Vec::new(),
+        }
+    }
+
+    fn clock_one_cpu_cycle(&mut self) -> Result<(), String> {
+        let nmi = self.bus.ppu().nmi_line();
+        self.nmi_levels.push(nmi);
+
+        let nmi_levels = self.bus.clock_cpu_cycle()?;
+
+        self.nmi_levels.extend(nmi_levels);
+
+        *self.cpu_cycles = (*self.cpu_cycles).wrapping_add(1);
+        Ok(())
+    }
+
+    fn take_nmi_levels(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.nmi_levels)
+    }
+}
+
+impl CpuBus for ClockedCpuBus<'_> {
+    fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
+        let value = self.bus.cpu_read(addr)?;
+        self.clock_one_cpu_cycle()?;
+        Ok(value)
+    }
+
+    fn cpu_write(&mut self, addr: u16, value: u8) -> Result<(), String> {
+        self.bus.cpu_write(addr, value)?;
+        self.clock_one_cpu_cycle()?;
+        Ok(())
     }
 }
 
@@ -620,6 +681,132 @@ mod tests {
             assert_eq!(nes.step().unwrap(), 3); // CLI 的旧 I 采样。
             assert!(nes.bus.irq_line());
             assert_eq!(nes.step().unwrap(), 7); // 随后才进入 IRQ。
+        }
+    }
+
+    mod clocked_cpu_bus_tests {
+        use super::*;
+
+        #[test]
+        fn adapter_clocks_each_read_and_write_once() {
+            let mut bus = Bus::new();
+            let mut cycles = 0u64;
+
+            // 普通 Bus 访问不自动计时。
+            bus.cpu_write(0x0010, 0x42).unwrap();
+            assert_eq!(bus.ppu().dot(), 0);
+
+            {
+                let mut clocked = ClockedCpuBus::new(&mut bus, &mut cycles);
+
+                assert_eq!(clocked.cpu_read(0x0010).unwrap(), 0x42);
+                clocked.cpu_write(0x0011, 0x99).unwrap();
+            }
+
+            assert_eq!(cycles, 2);
+            assert_eq!(bus.ppu().dot(), 6);
+            assert_eq!(bus.cpu_read(0x0011).unwrap(), 0x99);
+            assert_eq!(bus.ppu().dot(), 6);
+        }
+
+        #[test]
+        fn instructions_do_not_clock_twice() {
+            // LDA #$42；STA $0010；NOP
+            let mut nes = nes_with_program(&[0xA9, 0x42, 0x8D, 0x10, 0x00, 0xEA]);
+
+            for (cycles, total) in [(2, 2u64), (4, 6), (2, 8)] {
+                assert_eq!(nes.step().unwrap(), cycles);
+                assert_eq!(nes.cpu_cycles(), total);
+                assert_eq!(nes.bus().ppu().dot(), (total * 3) as u16);
+            }
+
+            assert_eq!(nes.bus.cpu_read(0x0010).unwrap(), 0x42);
+        }
+
+        fn advance_near_vblank(nes: &mut Nes) {
+            // 27392 * 3 = 82176 = 240 * 341 + 336。
+            for _ in 0..27_392 {
+                nes.clock_one_cpu_cycle().unwrap();
+            }
+
+            assert_eq!(nes.bus().ppu().scanline(), 240);
+            assert_eq!(nes.bus().ppu().dot(), 336);
+        }
+
+        #[test]
+        fn status_read_sees_ppu_progress_during_instruction() {
+            // LDA $2002；STA $00
+            let mut nes = nes_with_program(&[0xAD, 0x02, 0x20, 0x85, 0x00]);
+
+            advance_near_vblank(&mut nes);
+            let before = nes.cpu_cycles();
+
+            assert_eq!(nes.step().unwrap(), 4);
+            assert_eq!(nes.cpu_cycles(), before + 4);
+            assert_eq!(nes.step().unwrap(), 3);
+
+            // 前三个读取周期推进了 PPU；
+            // 第四个周期读取状态时，VBlank 已经置位。
+            let saved_status = nes.bus.cpu_read(0x0000).unwrap();
+            assert_eq!(saved_status & 0x80, 0x80);
+
+            // LDA $2002 已经清除了 VBlank。
+            assert_eq!(nes.bus.cpu_read(0x2002).unwrap() & 0x80, 0);
+        }
+
+        #[test]
+        fn nmi_edge_survives_status_read_in_same_instruction() {
+            // LDA $2002；NOP
+            let mut nes = nes_with_program(&[0xAD, 0x02, 0x20, 0xEA]);
+
+            // 现有测试 ROM 的 NMI 向量默认为 $0000。
+            // 在那里放置 RTI，作为测试中断处理程序。
+            nes.bus.cpu_write(0x0000, 0x40).unwrap();
+
+            // 开启 VBlank NMI，但不启用画面渲染。
+            nes.bus.cpu_write(0x2000, 0x80).unwrap();
+            advance_near_vblank(&mut nes);
+
+            assert_eq!(nes.step().unwrap(), 4);
+
+            // 指令中间产生过上升沿，随后被 $2002 读取拉低。
+            assert!(!nes.bus().ppu().nmi_line());
+
+            // 即使最终电平为低，仍应处理已锁存的 NMI。
+            assert_eq!(nes.step().unwrap(), 7);
+            assert_eq!(nes.bus.cpu_read(0x01FD).unwrap(), 0x80);
+            assert_eq!(nes.bus.cpu_read(0x01FC).unwrap(), 0x03);
+
+            assert_eq!(nes.step().unwrap(), 6); // RTI
+            assert_eq!(nes.step().unwrap(), 2); // 原程序的 NOP
+        }
+
+        #[test]
+        fn apu_advances_with_cpu_accesses() {
+            let mut nes = nes_with_program(&[0xEA]);
+
+            for _ in 0..29_826 {
+                nes.clock_one_cpu_cycle().unwrap();
+            }
+            assert!(!nes.bus.irq_line());
+
+            // 当前帧计数器在第 29828 个周期首次置位 IRQ。
+            assert_eq!(nes.step().unwrap(), 2);
+            assert_eq!(nes.cpu_cycles(), 29_828);
+            assert!(nes.bus.irq_line());
+        }
+
+        #[test]
+        fn failed_access_preserves_already_elapsed_cycles() {
+            // $6000 在当前 Bus 中尚未实现。
+            let mut nes = nes_with_program(&[0xAD, 0x00, 0x60]);
+
+            assert!(nes.step().is_err());
+
+            // 操作码和两个操作数字节已经读取成功；
+            // 失败的第四次访问不额外推进周期。
+            assert_eq!(nes.cpu_cycles(), 3);
+            assert_eq!(nes.bus().ppu().dot(), 9);
         }
     }
 }
