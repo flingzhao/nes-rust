@@ -18,6 +18,8 @@ pub struct Bus {
 
     #[cfg(test)]
     write_trace: Vec<(u16, u8)>,
+    #[cfg(test)]
+    read_trace: Vec<u16>,
 }
 
 impl Bus {
@@ -27,6 +29,8 @@ impl Bus {
             cartridge: None,
             #[cfg(test)]
             write_trace: Vec::new(),
+            #[cfg(test)]
+            read_trace: Vec::new(),
             ppu: Ppu::new(),
             apu: Apu::new(),
             oam_dma_request: None,
@@ -39,6 +43,8 @@ impl Bus {
     }
 
     pub fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
+        #[cfg(test)]
+        self.read_trace.push(addr);
         match addr {
             0x0000..=0x1FFF => {
                 let index = usize::from(addr & CPU_RAM_MIRROR_MASK);
@@ -51,10 +57,7 @@ impl Bus {
                     .ok_or_else(|| "No cartridge inserted".to_string())?;
                 Ok(self.ppu.cpu_read(addr, cartridge)?)
             }
-            0x4015 => {
-                // TODO(APU): 暂时报告无活动声道、无 APU IRQ。
-                Ok(self.apu.read_status())
-            }
+            0x4015 => Ok(self.apu.read_status()),
             0x4016 => Ok(self.controllers[0].read()),
             0x4017 => Ok(self.controllers[1].read()),
             0x8000..=0xFFFF => {
@@ -104,12 +107,25 @@ impl Bus {
         std::mem::take(&mut self.write_trace)
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_read_trace(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.read_trace)
+    }
+
     pub fn take_oam_dma_request(&mut self) -> Option<u8> {
         self.oam_dma_request.take()
     }
 
     pub fn ppu(&self) -> &Ppu {
         &self.ppu
+    }
+
+    pub fn apu(&mut self) -> &mut Apu {
+        &mut self.apu
+    }
+
+    pub(crate) fn dmc_output(&self) -> u8 {
+        self.apu.dmc_output()
     }
 
     pub(crate) fn clock_cpu_cycle(&mut self) -> Result<[bool; 3], String> {

@@ -144,4 +144,8 @@ impl Apu {
     pub fn dmc_output(&self) -> u8 {
         self.dmc.output()
     }
+
+    pub(crate) fn complete_dmc_sample_read(&mut self, value: u8) -> Result<(), String> {
+        self.dmc.complete_sample_read(value)
+    }
 }

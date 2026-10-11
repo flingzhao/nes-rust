@@ -1,10 +1,14 @@
+use std::io::Read;
+
 use crate::controller::Button;
 use crate::{bus::Bus, cpu::Cpu, cpu_bus::CpuBus};
+use crate::{dmc_dma::CpuBusCycle, dmc_dma::DmaPhase, dmc_dma::DmcDma, dmc_dma::DmcDmaAction};
 
 pub struct Nes {
     cpu: Cpu,
     bus: Bus,
     cpu_cycles: u64,
+    dmc_dma: DmcDma,
 }
 
 impl Nes {
@@ -13,6 +17,7 @@ impl Nes {
             cpu,
             bus,
             cpu_cycles: 0,
+            dmc_dma: DmcDma::new(),
         }
     }
 
@@ -21,7 +26,8 @@ impl Nes {
         self.cpu.set_irq_line(self.bus.irq_line());
 
         let (result, nmi_levels) = {
-            let mut bus = ClockedCpuBus::new(&mut self.bus, &mut self.cpu_cycles);
+            let mut bus =
+                ClockedCpuBus::new(&mut self.bus, &mut self.cpu_cycles, &mut self.dmc_dma);
 
             let result = self.cpu.step(&mut bus);
             let nmi_levels = bus.take_nmi_levels();
@@ -126,14 +132,16 @@ impl Nes {
 struct ClockedCpuBus<'a> {
     bus: &'a mut Bus,
     cpu_cycles: &'a mut u64,
+    dmc_dma: &'a mut DmcDma,
     nmi_levels: Vec<bool>,
 }
 
 impl<'a> ClockedCpuBus<'a> {
-    fn new(bus: &'a mut Bus, cpu_cycles: &'a mut u64) -> Self {
+    fn new(bus: &'a mut Bus, cpu_cycles: &'a mut u64, dmc_dma: &'a mut DmcDma) -> Self {
         Self {
             bus,
             cpu_cycles,
+            dmc_dma,
             nmi_levels: Vec::new(),
         }
     }
@@ -157,14 +165,48 @@ impl<'a> ClockedCpuBus<'a> {
 
 impl CpuBus for ClockedCpuBus<'_> {
     fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
-        let value = self.bus.cpu_read(addr)?;
-        self.clock_one_cpu_cycle()?;
-        Ok(value)
+        loop {
+            let phase = if *self.cpu_cycles & 1 == 0 {
+                DmaPhase::Put
+            } else {
+                DmaPhase::Get
+            };
+            let action = self.dmc_dma.clock(phase, CpuBusCycle::Read);
+            match action {
+                DmcDmaAction::Pass => {
+                    let value = self.bus.cpu_read(addr)?;
+                    self.clock_one_cpu_cycle()?;
+                    return Ok(value);
+                }
+                DmcDmaAction::Halt | DmcDmaAction::Dummy | DmcDmaAction::Align => {
+                    let _ = self.bus.cpu_read(addr)?;
+                    self.clock_one_cpu_cycle()?;
+                    continue;
+                }
+                DmcDmaAction::Read(sample_addr) => {
+                    let sample_value = self.bus.cpu_read(sample_addr)?;
+                    self.bus.apu().complete_dmc_sample_read(sample_value)?;
+                    self.clock_one_cpu_cycle()?;
+                    continue;
+                }
+            }
+        }
     }
 
     fn cpu_write(&mut self, addr: u16, value: u8) -> Result<(), String> {
-        self.bus.cpu_write(addr, value)?;
-        self.clock_one_cpu_cycle()?;
+        let phase = if *self.cpu_cycles & 1 == 0 {
+            DmaPhase::Put
+        } else {
+            DmaPhase::Get
+        };
+        let action = self.dmc_dma.clock(phase, CpuBusCycle::Write);
+        match action {
+            DmcDmaAction::Pass => {
+                self.bus.cpu_write(addr, value)?;
+                self.clock_one_cpu_cycle()?;
+            }
+            _ => unreachable!(),
+        }
         Ok(())
     }
 }
@@ -685,6 +727,7 @@ mod tests {
     }
 
     mod clocked_cpu_bus_tests {
+
         use super::*;
 
         #[test]
@@ -697,7 +740,8 @@ mod tests {
             assert_eq!(bus.ppu().dot(), 0);
 
             {
-                let mut clocked = ClockedCpuBus::new(&mut bus, &mut cycles);
+                let mut dmc_dma = DmcDma::new();
+                let mut clocked = ClockedCpuBus::new(&mut bus, &mut cycles, &mut dmc_dma);
 
                 assert_eq!(clocked.cpu_read(0x0010).unwrap(), 0x42);
                 clocked.cpu_write(0x0011, 0x99).unwrap();
@@ -807,6 +851,166 @@ mod tests {
             // 失败的第四次访问不额外推进周期。
             assert_eq!(nes.cpu_cycles(), 3);
             assert_eq!(nes.bus().ppu().dot(), 9);
+        }
+    }
+
+    mod dmc_bus_execution_tests {
+        use super::*;
+        use crate::dmc_dma::DmaPhase;
+
+        fn fixture(program: &[u8]) -> Nes {
+            assert!(program.len() < 0x80);
+            let mut rom = vec![0u8; 16 + 0x4000];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+            rom[16..16 + program.len()].copy_from_slice(program);
+
+            // Mapper 0 的 16 KiB PRG 镜像：CPU $C080 对应 PRG 偏移 $0080。
+            rom[16 + 0x80] = 0xA5;
+            rom[16 + 0x3FFC..16 + 0x3FFE].copy_from_slice(&0x8000u16.to_le_bytes());
+
+            let cartridge = Cartridge::try_from(rom.as_slice()).unwrap();
+            let mut bus = Bus::new();
+            bus.insert_cartridge(cartridge);
+            let mut cpu = Cpu::new();
+            cpu.reset(&mut bus).unwrap();
+            let mut nes = Nes::new(cpu, bus);
+
+            // IRQ 开启、不循环、速率 0；输出起点 64。
+            // 样本从 $C080 开始，长度为 1 字节。
+            // 本轮普通 Bus 写入只配置 DMC，不自动调度 DMA。
+            for (addr, value) in [
+                (0x4010, 0x80),
+                (0x4011, 64),
+                (0x4012, 2),
+                (0x4013, 0),
+                (0x4015, 0x10),
+            ] {
+                nes.bus.cpu_write(addr, value).unwrap();
+            }
+            nes.bus.take_read_trace();
+            nes.bus.take_write_trace();
+            nes
+        }
+
+        fn align_next_cycle_to_get(nes: &mut Nes) {
+            if nes.cpu_cycles() & 1 == 0 {
+                nes.clock_one_cpu_cycle().unwrap();
+            }
+            assert_eq!(nes.cpu_cycles() & 1, 1);
+        }
+
+        #[test]
+        fn load_survives_instruction_boundary_and_resumes_same_read() {
+            let mut nes = fixture(&[0xEA, 0xEA, 0xEA]);
+            align_next_cycle_to_get(&mut nes);
+            let before = nes.cpu_cycles();
+            let dot_before = nes.bus().ppu().dot();
+
+            // 模拟在前一个 Put 周期发出的 load 请求。
+            nes.dmc_dma.request_load(0xC080, DmaPhase::Put).unwrap();
+
+            // 两个等待周期允许第一条 NOP 完成，请求跨指令保存。
+            assert_eq!(nes.step().unwrap(), 2);
+            assert_eq!(nes.cpu_cycles() - before, 2);
+            assert!(nes.dmc_dma.is_busy());
+            assert_eq!(nes.bus.take_read_trace(), vec![0x8000, 0x8001]);
+
+            // 第二条 NOP：三周期 DMA 停顿 + 两周期指令。
+            assert_eq!(nes.step().unwrap(), 2);
+            assert_eq!(nes.cpu_cycles() - before, 7);
+            assert!(!nes.dmc_dma.is_busy());
+            assert_eq!(nes.bus().ppu().dot() - dot_before, 21);
+            assert_eq!(
+                nes.bus.take_read_trace(),
+                vec![
+                    0x8001, // Halt：重复待完成的 CPU 读取。
+                    0x8001, // Dummy。
+                    0xC080, // DMA 读取样本，不能返回给 CPU。
+                    0x8001, // Pass：CPU 真正取得第二条 NOP 的操作码。
+                    0x8002, // NOP 的第二个周期。
+                ]
+            );
+
+            // DMC active 清零，样本读取结束 IRQ 置位。
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0x80);
+            assert!(nes.bus.irq_line());
+            assert_eq!(nes.bus.dmc_output(), 64); // 已取到样本不等于已播放。
+
+            // 请求不能在下一条指令中重复执行。
+            nes.bus.take_read_trace();
+            let before = nes.cpu_cycles();
+            assert_eq!(nes.step().unwrap(), 2);
+            assert_eq!(nes.cpu_cycles() - before, 2);
+            assert_eq!(nes.bus.take_read_trace(), vec![0x8002, 0x8003]);
+        }
+
+        #[test]
+        fn load_due_on_write_allows_write_then_halts_next_read() {
+            // A 初值为 0；STA $0010；NOP。
+            let mut nes = fixture(&[0x8D, 0x10, 0x00, 0xEA]);
+            assert_eq!(nes.cpu_cycles() & 1, 0); // 下一个周期 Put。
+            nes.dmc_dma.request_load(0xC080, DmaPhase::Get).unwrap();
+
+            // 第四个周期到期，但该周期是写，必须正常完成。
+            assert_eq!(nes.step().unwrap(), 4);
+            assert_eq!(nes.cpu_cycles(), 4);
+            assert!(nes.dmc_dma.is_busy());
+            assert_eq!(nes.bus.take_write_trace(), vec![(0x0010, 0)]);
+            assert_eq!(nes.bus.take_read_trace(), vec![0x8000, 0x8001, 0x8002]);
+
+            // 下一个 Put 周期暂停：Halt、Dummy、Align、Read 共四周期。
+            assert_eq!(nes.step().unwrap(), 2);
+            assert_eq!(nes.cpu_cycles(), 10);
+            assert_eq!(nes.bus().ppu().dot(), 30);
+            assert_eq!(
+                nes.bus.take_read_trace(),
+                vec![0x8003, 0x8003, 0x8003, 0xC080, 0x8003, 0x8004]
+            );
+            assert!(nes.bus.take_write_trace().is_empty());
+            assert!(!nes.dmc_dma.is_busy());
+        }
+
+        #[test]
+        fn reload_waits_for_put_and_inserts_four_stalled_cycles() {
+            let mut nes = fixture(&[0xEA, 0xEA]);
+            align_next_cycle_to_get(&mut nes);
+            let before = nes.cpu_cycles();
+            nes.dmc_dma.request_reload(0xC080).unwrap();
+
+            // Get 周期先执行操作码读取，Put 周期暂停 NOP 的第二次读取。
+            assert_eq!(nes.step().unwrap(), 2);
+            assert_eq!(nes.cpu_cycles() - before, 6);
+            assert_eq!(
+                nes.bus.take_read_trace(),
+                vec![0x8000, 0x8001, 0x8001, 0x8001, 0xC080, 0x8001]
+            );
+            assert!(!nes.dmc_dma.is_busy());
+
+            let before = nes.cpu_cycles();
+            assert_eq!(nes.step().unwrap(), 2);
+            assert_eq!(nes.cpu_cycles() - before, 2);
+        }
+
+        #[test]
+        fn dma_delivers_sample_and_apu_keeps_running_during_stalls() {
+            let mut nes = fixture(&[0xEA, 0xEA]);
+            align_next_cycle_to_get(&mut nes);
+            nes.dmc_dma.request_load(0xC080, DmaPhase::Put).unwrap();
+            nes.step().unwrap();
+            nes.step().unwrap();
+            assert_eq!(nes.bus.dmc_output(), 64);
+
+            // 现有 DMC timer 初值 0，速率 0 每 428 CPU 周期移出一位。
+            // 第 1、429、857……周期处理初始静音组；
+            // 第 2997 周期将 $A5 装入移位寄存器；
+            // 第 3425 周期消费它的 bit 0（1），输出从 64 变为 66。
+            while nes.cpu_cycles() < 3424 {
+                nes.clock_one_cpu_cycle().unwrap();
+            }
+            assert_eq!(nes.bus.dmc_output(), 64);
+            nes.clock_one_cpu_cycle().unwrap();
+            assert_eq!(nes.bus.dmc_output(), 66);
         }
     }
 }
