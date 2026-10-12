@@ -1,8 +1,7 @@
-use std::io::Read;
-
 use crate::controller::Button;
 use crate::{bus::Bus, cpu::Cpu, cpu_bus::CpuBus};
 use crate::{dmc_dma::CpuBusCycle, dmc_dma::DmaPhase, dmc_dma::DmcDma, dmc_dma::DmcDmaAction};
+use crate::{oam_dma::OamDma, oam_dma::OamDmaAction};
 
 pub struct Nes {
     cpu: Cpu,
@@ -43,7 +42,7 @@ impl Nes {
 
         let cycles = result?;
 
-        self.run_pending_oam_dma()?;
+        // self.run_pending_oam_dma()?;
 
         Ok(cycles)
     }
@@ -179,27 +178,50 @@ impl<'a> ClockedCpuBus<'a> {
 
 impl CpuBus for ClockedCpuBus<'_> {
     fn cpu_read(&mut self, addr: u16) -> Result<u8, String> {
+        let mut oam_dma = OamDma::new();
+
+        if let Some(page) = self.bus.take_oam_dma_request() {
+            oam_dma.request(page)?;
+        }
         loop {
             let phase = if *self.cpu_cycles & 1 == 0 {
                 DmaPhase::Put
             } else {
                 DmaPhase::Get
             };
-            let action = self.dmc_dma.clock(phase, CpuBusCycle::Read);
-            match action {
-                DmcDmaAction::Pass => {
-                    let value = self.bus.cpu_read(addr)?;
-                    self.clock_one_cpu_cycle()?;
-                    return Ok(value);
-                }
-                DmcDmaAction::Halt | DmcDmaAction::Dummy | DmcDmaAction::Align => {
-                    let _ = self.bus.cpu_read(addr)?;
+            let dmc_action = self.dmc_dma.clock(phase, CpuBusCycle::Read);
+            if let DmcDmaAction::Read(sample_addr) = dmc_action {
+                let sample_value = self.bus.cpu_read(sample_addr)?;
+                self.bus.apu().complete_dmc_sample_read(sample_value)?;
+                self.clock_one_cpu_cycle()?;
+                continue;
+            }
+            let oam_action = oam_dma.clock(phase, CpuBusCycle::Read)?;
+            match oam_action {
+                OamDmaAction::Read(source_addr) => {
+                    let value = self.bus.cpu_read(source_addr)?;
+                    oam_dma.complete_read(value)?;
                     self.clock_one_cpu_cycle()?;
                     continue;
                 }
-                DmcDmaAction::Read(sample_addr) => {
-                    let sample_value = self.bus.cpu_read(sample_addr)?;
-                    self.bus.apu().complete_dmc_sample_read(sample_value)?;
+                OamDmaAction::Write(value) => {
+                    self.bus.cpu_write(0x2004, value)?;
+                    self.clock_one_cpu_cycle()?;
+                    continue;
+                }
+                OamDmaAction::Pass => {
+                    if dmc_action == DmcDmaAction::Pass {
+                        let value = self.bus.cpu_read(addr)?;
+                        self.clock_one_cpu_cycle()?;
+                        return Ok(value);
+                    } else {
+                        let _ = self.bus.cpu_read(addr)?;
+                        self.clock_one_cpu_cycle()?;
+                        continue;
+                    }
+                }
+                _ => {
+                    let _ = self.bus.cpu_read(addr)?;
                     self.clock_one_cpu_cycle()?;
                     continue;
                 }
@@ -523,24 +545,6 @@ mod tests {
                     expected_oam_byte(destination, source)
                 );
             }
-        }
-
-        #[test]
-        fn step_runs_dma_before_executing_the_next_instruction() {
-            let mut nes = fixture();
-            fill_page(&mut nes, 2, 0xA5);
-
-            assert_eq!(nes.step().unwrap(), 2); // LDA
-            assert_eq!(nes.cpu_cycles(), 2);
-
-            assert_eq!(nes.step().unwrap(), 4); // STA + DMA
-            assert_eq!(nes.cpu_cycles(), 2 + 4 + 513);
-
-            assert_eq!(nes.bus.ppu().oam()[0], 0xA5);
-            assert_eq!(nes.bus.ppu().oam()[255], 0xFF ^ 0xA5);
-
-            assert_eq!(nes.step().unwrap(), 2); // DMA 后才执行 NOP
-            assert_eq!(nes.cpu_cycles(), 2 + 4 + 513 + 2);
         }
     }
 
@@ -1397,6 +1401,281 @@ mod tests {
             assert!(!nes.bus.irq_line());
             assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0);
             assert_eq!(nes.bus.dmc_output(), 64);
+        }
+    }
+
+    // Append this whole module at FILE SCOPE in src/nes.rs.
+    // It replaces the old oam_dma_tests module that directly invoked
+    // run_pending_oam_dma(); keep the standalone oam_dma.rs tests unchanged.
+    // ClockedCpuBus::new retains its existing three arguments.
+    // No new production getter or tracing API is required.
+    // These tests have NOT been run by the assistant.
+    #[cfg(test)]
+    mod oam_dmc_shared_bus_tests {
+        use super::{ClockedCpuBus, Nes};
+        use crate::{bus::Bus, cartridge::Cartridge, cpu::Cpu, cpu_bus::CpuBus};
+
+        fn source_byte(page: u8, offset: u8) -> u8 {
+            offset.rotate_left(3) ^ page ^ 0xA5
+        }
+
+        fn fixture(program: &[u8]) -> Nes {
+            assert!(program.len() < 0x80);
+            let mut rom = vec![0u8; 16 + 0x4000];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+            let prg = &mut rom[16..];
+            prg[..program.len()].copy_from_slice(program);
+            prg[0x80] = 0xA5; // CPU $C080, using the 16 KiB PRG mirror.
+            prg[0x81] = 0x3C; // CPU $C081.
+            prg[0x3FFC..0x3FFE].copy_from_slice(&0x8000u16.to_le_bytes());
+
+            let mut bus = Bus::new();
+            bus.insert_cartridge(Cartridge::try_from(rom.as_slice()).unwrap());
+            for page in [0x02u8, 0x03] {
+                for offset in 0..256u16 {
+                    bus.cpu_write(
+                        (u16::from(page) << 8) | offset,
+                        source_byte(page, offset as u8),
+                    )
+                    .unwrap();
+                }
+            }
+            bus.cpu_write(0x0000, 0x02).unwrap();
+            bus.cpu_write(0x2001, 0).unwrap(); // Rendering off for these tests.
+            bus.cpu_write(0x2003, 0xFC).unwrap(); // Exercise OAM destination wrap.
+            bus.cpu_write(0x4010, 0).unwrap(); // Rate 0: 428 CPU cycles per bit.
+            bus.cpu_write(0x4011, 64).unwrap();
+            bus.cpu_write(0x4012, 2).unwrap(); // Sample begins at $C080.
+            bus.cpu_write(0x4013, 1).unwrap(); // 17 sample bytes.
+            bus.cpu_write(0x4017, 0x40).unwrap(); // Frame IRQ inhibited.
+
+            let mut cpu = Cpu::new();
+            cpu.reset(&mut bus).unwrap();
+            bus.take_read_trace();
+            bus.take_write_trace();
+            Nes::new(cpu, bus)
+        }
+
+        // Exercise the real clocked adapter, rather than an OAM-specific helper.
+        // No interrupt is pending in these fixtures, so the captured NMI history
+        // can be dropped here. Production Nes::step must retain its NMI replay.
+        fn clocked_read(nes: &mut Nes, addr: u16) -> u8 {
+            let mut bus = ClockedCpuBus::new(&mut nes.bus, &mut nes.cpu_cycles, &mut nes.dmc_dma);
+            CpuBus::cpu_read(&mut bus, addr).unwrap()
+        }
+
+        fn clocked_write(nes: &mut Nes, addr: u16, value: u8) {
+            let mut bus = ClockedCpuBus::new(&mut nes.bus, &mut nes.cpu_cycles, &mut nes.dmc_dma);
+            CpuBus::cpu_write(&mut bus, addr, value).unwrap();
+        }
+
+        fn clear_traces(nes: &mut Nes) {
+            nes.bus.take_read_trace();
+            nes.bus.take_write_trace();
+        }
+
+        fn assert_oam_writes_and_image(nes: &mut Nes, data_page: u8) {
+            let writes: Vec<u8> = nes
+                .bus
+                .take_write_trace()
+                .into_iter()
+                .filter_map(|(addr, value)| (addr == 0x2004).then_some(value))
+                .collect();
+            let expected: Vec<u8> = (0..256u16)
+                .map(|offset| source_byte(data_page, offset as u8))
+                .collect();
+            assert_eq!(writes, expected, "exactly 256 ordered writes to $2004");
+
+            // OAMADDR must wrap back to $FC after 256 writes. OAMDATA reads
+            // do not increment it; inspect it before explicitly selecting addresses.
+            assert_eq!(nes.bus.cpu_read(0x2004).unwrap(), source_byte(data_page, 0));
+            for offset in 0..256u16 {
+                let destination = 0xFCu8.wrapping_add(offset as u8);
+                nes.bus.cpu_write(0x2003, destination).unwrap();
+                let value = source_byte(data_page, offset as u8);
+                let stored = if destination & 3 == 2 {
+                    value & 0xE3
+                } else {
+                    value
+                };
+                assert_eq!(
+                    nes.bus.cpu_read(0x2004).unwrap(),
+                    stored,
+                    "OAM destination ${destination:02X}, source offset {offset}"
+                );
+            }
+        }
+
+        #[test]
+        fn sta_4014_only_queues_dma_and_next_cpu_read_performs_it() {
+            for (load, operand, load_cycles, after_sta, stall) in [
+                (0xA9, 0x02, 2, 6u64, 513u64), // Next cycle is Put.
+                (0xA5, 0x00, 3, 7u64, 514u64), // Next cycle is Get.
+            ] {
+                let mut nes = fixture(&[load, operand, 0x8D, 0x14, 0x40, 0xEA]);
+                assert_eq!(nes.step().unwrap(), load_cycles);
+                assert_eq!(nes.step().unwrap(), 4);
+                assert_eq!(
+                    nes.cpu_cycles(),
+                    after_sta,
+                    "STA must not eagerly drain OAM DMA at instruction end"
+                );
+                assert!(!nes.bus.take_write_trace().iter().any(|&(a, _)| a == 0x2004));
+                nes.bus.take_read_trace();
+
+                assert_eq!(nes.step().unwrap(), 2); // NOP still reports 2 nominal cycles.
+                assert_eq!(nes.cpu_cycles(), after_sta + stall + 2);
+                let reads = nes.bus.take_read_trace();
+                let source: Vec<u16> = reads
+                    .iter()
+                    .copied()
+                    .filter(|a| (0x0200..=0x02FF).contains(a))
+                    .collect();
+                assert_eq!(source, (0x0200u16..=0x02FF).collect::<Vec<_>>());
+                assert_eq!(
+                    &reads[reads.len() - 2..],
+                    &[0x8005, 0x8006],
+                    "CPU resumes the held opcode read, then NOP's dummy read"
+                );
+                assert_oam_writes_and_image(&mut nes, 0x02);
+            }
+        }
+
+        #[test]
+        fn consecutive_cpu_writes_continue_and_last_oam_page_wins() {
+            let mut nes = fixture(&[0xEA]);
+            // Prepare a real DMC reader, but use a low-level request to place
+            // its halt attempt exactly on the first CPU write below.
+            nes.bus.cpu_write(0x4015, 0x10).unwrap();
+            nes.dmc_dma.request_reload(0xC080).unwrap();
+            clear_traces(&mut nes);
+
+            clocked_write(&mut nes, 0x4014, 0x02);
+            clocked_write(&mut nes, 0x4014, 0x03);
+            assert_eq!(nes.cpu_cycles(), 2);
+            assert!(nes.dmc_dma.is_busy());
+            assert!(nes.bus.take_read_trace().is_empty());
+            assert_eq!(nes.bus.take_write_trace(), vec![(0x4014, 2), (0x4014, 3)]);
+
+            let before = nes.cpu_cycles();
+            assert_eq!(clocked_read(&mut nes, 0x8000), 0xEA);
+            assert_eq!(nes.cpu_cycles() - before, 516); // 513 + overlap 2 + CPU read 1.
+            let reads = nes.bus.take_read_trace();
+            assert_eq!(reads.iter().filter(|&&a| a == 0xC080).count(), 1);
+            assert!(!reads.iter().any(|a| (0x0200..=0x02FF).contains(a)));
+            assert_eq!(
+                reads
+                    .iter()
+                    .copied()
+                    .filter(|a| (0x0300..=0x03FF).contains(a))
+                    .collect::<Vec<_>>(),
+                (0x0300u16..=0x03FF).collect::<Vec<_>>()
+            );
+            assert_oam_writes_and_image(&mut nes, 0x03);
+        }
+
+        #[test]
+        fn oam_source_uses_cpu_ram_mirrors() {
+            let mut nes = fixture(&[0xEA]);
+            clocked_write(&mut nes, 0x4014, 0x0A); // $0A00 mirrors $0200.
+            clear_traces(&mut nes);
+            let before = nes.cpu_cycles();
+            assert_eq!(clocked_read(&mut nes, 0x8000), 0xEA);
+            assert_eq!(nes.cpu_cycles() - before, 515); // 514 stall + 1 resumed read.
+            let reads = nes.bus.take_read_trace();
+            assert_eq!(
+                reads
+                    .into_iter()
+                    .filter(|a| (0x0A00..=0x0AFF).contains(a))
+                    .collect::<Vec<_>>(),
+                (0x0A00u16..=0x0AFF).collect::<Vec<_>>()
+            );
+            assert_oam_writes_and_image(&mut nes, 0x02);
+        }
+
+        #[test]
+        fn shared_halt_dummy_and_alignment_do_not_duplicate_bus_reads() {
+            let mut nes = fixture(&[0xEA]);
+            nes.bus.cpu_write(0x4015, 0x10).unwrap();
+            nes.dmc_dma.request_reload(0xC080).unwrap();
+            nes.bus.cpu_write(0x4014, 0x02).unwrap();
+            clear_traces(&mut nes);
+
+            assert_eq!(clocked_read(&mut nes, 0x8000), 0xEA);
+            assert_eq!(nes.cpu_cycles(), 516);
+            let reads = nes.bus.take_read_trace();
+            // Shared Halt; OAM read during DMC Dummy; DMC sample read;
+            // OAM alignment; remaining OAM reads; resumed CPU read.
+            let mut expected = vec![0x8000, 0x0200, 0xC080, 0x8000];
+            expected.extend(0x0201u16..=0x02FF);
+            expected.push(0x8000);
+            assert_eq!(reads, expected);
+            assert!(!nes.dmc_dma.is_busy());
+            assert_oam_writes_and_image(&mut nes, 0x02);
+        }
+
+        // Real APU clocks empty the existing sample buffer and automatically
+        // request $C081 while OAM is in progress. No request_reload() here.
+        // With the existing timer=0/bits_remaining=8 initialization at rate 0,
+        // the buffer empties after 2997 clocks; reload Halt is at counter 2998.
+        fn automatic_overlap(start: u64, extra: u64, dmc_after_oam_reads: usize) {
+            let mut nes = fixture(&[0xEA]);
+            nes.bus.cpu_write(0x4015, 0x10).unwrap();
+            nes.bus.apu().complete_dmc_sample_read(0xA5).unwrap();
+            for _ in 0..start {
+                assert_eq!(clocked_read(&mut nes, 0x8000), 0xEA);
+            }
+            assert_eq!(nes.cpu_cycles(), start);
+            assert!(!nes.dmc_dma.is_busy());
+            nes.bus.cpu_write(0x4014, 0x02).unwrap();
+            clear_traces(&mut nes);
+
+            assert_eq!(clocked_read(&mut nes, 0x8000), 0xEA);
+            assert_eq!(
+                nes.cpu_cycles() - start,
+                514 + extra,
+                "513 OAM stall + overlap extension + 1 resumed CPU read"
+            );
+            let reads = nes.bus.take_read_trace();
+            let position = reads
+                .iter()
+                .position(|&a| a == 0xC081)
+                .expect("APU must request and fetch the next sample DURING OAM DMA");
+            assert_eq!(reads.iter().filter(|&&a| a == 0xC081).count(), 1);
+            assert_eq!(
+                reads[..position]
+                    .iter()
+                    .filter(|a| (0x0200..=0x02FF).contains(*a))
+                    .count(),
+                dmc_after_oam_reads
+            );
+            assert_eq!(
+                reads
+                    .iter()
+                    .copied()
+                    .filter(|a| (0x0200..=0x02FF).contains(a))
+                    .collect::<Vec<_>>(),
+                (0x0200u16..=0x02FF).collect::<Vec<_>>()
+            );
+            assert_eq!(reads.last(), Some(&0x8000));
+            assert!(!nes.dmc_dma.is_busy());
+            assert_oam_writes_and_image(&mut nes, 0x02);
+        }
+
+        #[test]
+        fn automatic_dmc_reload_in_middle_of_oam_adds_two_cycles() {
+            automatic_overlap(2800, 2, 100);
+        }
+
+        #[test]
+        fn dmc_halt_on_second_last_oam_write_extends_transfer_by_one_cycle() {
+            automatic_overlap(2488, 1, 256);
+        }
+
+        #[test]
+        fn dmc_halt_on_last_oam_write_extends_transfer_by_three_cycles() {
+            automatic_overlap(2486, 3, 256);
         }
     }
 }
