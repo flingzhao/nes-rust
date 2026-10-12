@@ -126,6 +126,10 @@ impl Nes {
     pub fn release_all_buttons(&mut self) {
         self.bus.release_all_buttons();
     }
+
+    pub fn take_audio_samples(&mut self) -> Vec<f32> {
+        self.bus.take_audio_samples()
+    }
 }
 
 struct ClockedCpuBus<'a> {

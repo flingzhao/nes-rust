@@ -1,4 +1,5 @@
 use crate::apu::Apu;
+use crate::audio::CpuRateSampler;
 use crate::cartridge::Cartridge;
 use crate::controller::{Button, Controller};
 use crate::ppu::Ppu;
@@ -15,6 +16,8 @@ pub struct Bus {
     oam_dma_request: Option<u8>,
     controllers: [Controller; 2],
     apu: Apu,
+    audio_sampler: CpuRateSampler,
+    audio_samples: Vec<f32>,
 
     #[cfg(test)]
     write_trace: Vec<(u16, u8)>,
@@ -35,6 +38,12 @@ impl Bus {
             apu: Apu::new(),
             oam_dma_request: None,
             controllers: [Controller::new(), Controller::new()],
+            audio_sampler: CpuRateSampler::new(
+                crate::audio::NTSC_CPU_HZ,
+                crate::audio::AUDIO_SAMPLE_RATE,
+            )
+            .expect(""),
+            audio_samples: Vec::<f32>::new(),
         }
     }
 
@@ -139,11 +148,20 @@ impl Bus {
 
         self.apu.clock_cpu_cycle();
 
+        let level = self.apu.mixed_output();
+        if let Some(sample) = self.audio_sampler.push_cycle(level) {
+            self.audio_samples.push(sample);
+        }
+
         Ok(levels)
     }
 
     pub fn take_frame_ready(&mut self) -> bool {
         self.ppu.take_frame_ready()
+    }
+
+    pub(crate) fn take_audio_samples(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.audio_samples)
     }
 
     // impl Bus
