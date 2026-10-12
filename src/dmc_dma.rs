@@ -126,6 +126,24 @@ impl DmcDma {
             }
         }
     }
+
+    pub(crate) fn cancel_pending(&mut self) -> Result<(), String> {
+        match self.state {
+            DmcDmaState::Idle => Ok(()),
+            DmcDmaState::WaitingForLoad {
+                addr: _,
+                cycles_until_attempt: _,
+            }
+            | DmcDmaState::WaitingForReload(_)
+            | DmcDmaState::WaitingForHalt(_) => {
+                self.state = DmcDmaState::Idle;
+                Ok(())
+            }
+            DmcDmaState::Dummy(_) | DmcDmaState::WaitingForRead(_) => {
+                return Err(("current dmc_dma state: dummy/WaitingForRead").to_string());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,5 +523,67 @@ mod start_timing_tests {
         assert_eq!(dma.clock(Get, CpuRead), Read(0xC081));
         assert!(!dma.is_busy());
         assert!(dma.request_load(0xD000, Put).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cancel_pending_tests {
+    use super::{CpuBusCycle, DmaPhase, DmcDma, DmcDmaAction, DmcDmaState};
+
+    #[test]
+    fn cancellation_is_idempotent_for_idle_and_all_waiting_states() {
+        let states = [
+            DmcDmaState::Idle,
+            DmcDmaState::WaitingForLoad {
+                addr: 0xC080,
+                cycles_until_attempt: 3,
+            },
+            DmcDmaState::WaitingForReload(0xC080),
+            DmcDmaState::WaitingForHalt(0xC080),
+        ];
+        for state in states {
+            let mut dma = DmcDma { state };
+            dma.cancel_pending().unwrap();
+            assert_eq!(dma.state, DmcDmaState::Idle);
+            assert!(!dma.is_busy());
+            dma.cancel_pending().unwrap();
+            for phase in [DmaPhase::Put, DmaPhase::Get] {
+                assert_eq!(dma.clock(phase, CpuBusCycle::Read), DmcDmaAction::Pass);
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_rejects_active_transfer_without_changing_state() {
+        for state in [
+            DmcDmaState::Dummy(0xC080),
+            DmcDmaState::WaitingForRead(0xC080),
+        ] {
+            let mut dma = DmcDma { state };
+            assert!(dma.cancel_pending().is_err());
+            assert_eq!(dma.state, state);
+        }
+    }
+
+    #[test]
+    fn new_load_after_cancellation_uses_new_address_and_full_delay() {
+        let mut dma = DmcDma::new();
+        dma.request_load(0xC080, DmaPhase::Put).unwrap();
+        assert_eq!(
+            dma.clock(DmaPhase::Get, CpuBusCycle::Write),
+            DmcDmaAction::Pass
+        );
+        dma.cancel_pending().unwrap();
+        dma.request_load(0xC0C0, DmaPhase::Put).unwrap();
+        for (phase, expected) in [
+            (DmaPhase::Get, DmcDmaAction::Pass),
+            (DmaPhase::Put, DmcDmaAction::Pass),
+            (DmaPhase::Get, DmcDmaAction::Halt),
+            (DmaPhase::Put, DmcDmaAction::Dummy),
+            (DmaPhase::Get, DmcDmaAction::Read(0xC0C0)),
+        ] {
+            assert_eq!(dma.clock(phase, CpuBusCycle::Read), expected);
+        }
+        assert!(!dma.is_busy());
     }
 }

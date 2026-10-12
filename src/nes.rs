@@ -218,6 +218,11 @@ impl CpuBus for ClockedCpuBus<'_> {
             DmcDmaAction::Pass => {
                 let former_dmc_active = self.bus.dmc_active();
                 self.bus.cpu_write(addr, value)?;
+
+                if addr == 0x4015 && value & 0x10 == 0 {
+                    self.dmc_dma.cancel_pending()?;
+                }
+
                 if addr == 0x4015
                     && value & 0x10 != 0
                     && !former_dmc_active
@@ -1218,6 +1223,180 @@ mod tests {
             assert!(sample_reads(&mut nes).is_empty());
             run_to(&mut nes, 3_100);
             assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+        }
+    }
+
+    mod dmc_stop_restart_tests {
+        use super::*;
+
+        fn fixture(length: u8) -> Nes {
+            let mut rom = vec![0u8; 16 + 0x4000];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+            let prg = &mut rom[16..];
+            prg[0x80] = 0xA5; // CPU $C080。
+            prg[0xC0] = 0x3C; // CPU $C0C0。
+            prg[0x3FFC..0x3FFE].copy_from_slice(&0x8000u16.to_le_bytes());
+            let mut bus = Bus::new();
+            bus.insert_cartridge(Cartridge::try_from(rom.as_slice()).unwrap());
+            bus.cpu_write(0x4010, 0x80).unwrap(); // IRQ 开启、无循环、rate 0。
+            bus.cpu_write(0x4011, 64).unwrap();
+            bus.cpu_write(0x4012, 2).unwrap();
+            bus.cpu_write(0x4013, length).unwrap();
+            bus.cpu_write(0x4017, 0x40).unwrap(); // 禁止 frame IRQ。
+            let mut cpu = Cpu::new();
+            cpu.reset(&mut bus).unwrap();
+            bus.take_read_trace();
+            Nes::new(cpu, bus)
+        }
+
+        fn write(nes: &mut Nes, addr: u16, value: u8) {
+            let mut adapter =
+                ClockedCpuBus::new(&mut nes.bus, &mut nes.cpu_cycles, &mut nes.dmc_dma);
+            adapter.cpu_write(addr, value).unwrap();
+            // 本组不执行 CPU 指令，仅验证 DMA/APU，不回放 NMI。
+        }
+
+        fn read_ram(nes: &mut Nes) {
+            let mut adapter =
+                ClockedCpuBus::new(&mut nes.bus, &mut nes.cpu_cycles, &mut nes.dmc_dma);
+            adapter.cpu_read(0x0000).unwrap();
+        }
+
+        fn run_to(nes: &mut Nes, target: u64) {
+            for _ in 0..20_000 {
+                if nes.cpu_cycles() >= target {
+                    return;
+                }
+                read_ram(nes);
+            }
+            panic!("did not reach {target} CPU cycles");
+        }
+
+        fn sample_reads(nes: &mut Nes) -> Vec<u16> {
+            nes.bus
+                .take_read_trace()
+                .into_iter()
+                .filter(|addr| (0xC080u16..=0xC0FF).contains(addr))
+                .collect()
+        }
+
+        #[test]
+        fn disabling_pending_load_cancels_it_on_both_phases() {
+            for prefix_cycles in [0, 1] {
+                let mut nes = fixture(1);
+                if prefix_cycles == 1 {
+                    write(&mut nes, 0x0000, 0);
+                }
+                write(&mut nes, 0x4015, 0x10);
+                assert!(nes.dmc_dma.is_busy());
+                let before = nes.cpu_cycles();
+                write(&mut nes, 0x4015, 0x00);
+                assert_eq!(nes.cpu_cycles(), before + 1);
+                assert!(!nes.dmc_dma.is_busy());
+                assert!(!nes.bus.dmc_active());
+                assert_eq!(nes.bus.dmc_next_sample_address(), None);
+                read_ram(&mut nes);
+                assert_eq!(nes.cpu_cycles(), before + 2);
+                assert!(sample_reads(&mut nes).is_empty());
+            }
+        }
+
+        #[test]
+        fn stop_write_cancels_reload_even_when_halt_attempt_is_due() {
+            let mut nes = fixture(1);
+            write(&mut nes, 0x4015, 0x10);
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+
+            // 当前初始 timer=0、bits_remaining=8：2997 时缓冲进入移位寄存器。
+            run_to(&mut nes, 2997);
+            assert_eq!(nes.cpu_cycles(), 2997);
+            assert!(nes.dmc_dma.is_busy());
+            assert_eq!(nes.bus.dmc_next_sample_address(), Some(0xC081));
+
+            // 下一周期 Get：reload 尚不尝试 Halt，正常写 RAM。
+            write(&mut nes, 0x0000, 0);
+            assert_eq!(nes.cpu_cycles(), 2998);
+            // 下一周期 Put：尝试 Halt，但 CPU 正在写 $4015，先放行再取消。
+            write(&mut nes, 0x4015, 0);
+            assert_eq!(nes.cpu_cycles(), 2999);
+            assert!(!nes.dmc_dma.is_busy());
+            read_ram(&mut nes);
+            assert_eq!(nes.cpu_cycles(), 3000);
+            assert!(sample_reads(&mut nes).is_empty());
+        }
+
+        #[test]
+        fn restart_after_cancellation_fetches_new_sample_not_stale_address() {
+            let mut nes = fixture(1);
+            write(&mut nes, 0x4015, 0x10);
+            write(&mut nes, 0x4015, 0x00);
+            write(&mut nes, 0x4012, 3); // 新起点 $C0C0。
+            write(&mut nes, 0x4013, 0); // 新长度 1。
+            write(&mut nes, 0x4015, 0x10);
+            assert!(nes.dmc_dma.is_busy());
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC0C0]);
+            assert!(!nes.dmc_dma.is_busy());
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0x80);
+        }
+
+        #[test]
+        fn disabling_preserves_buffer_and_output_without_fetching_more() {
+            let mut nes = fixture(1);
+            write(&mut nes, 0x4015, 0x10);
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+            assert_eq!(nes.bus.dmc_output(), 64);
+            write(&mut nes, 0x4015, 0);
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0);
+            assert_eq!(nes.bus.dmc_output(), 64);
+
+            run_to(&mut nes, 3424);
+            assert_eq!(nes.bus.dmc_output(), 64);
+            read_ram(&mut nes); // 3425：旧样本 $A5 的最低位为 1，64 -> 66。
+            assert_eq!(nes.cpu_cycles(), 3425);
+            assert_eq!(nes.bus.dmc_output(), 66);
+            run_to(&mut nes, 7000); // $A5 四个 1、四个 0，最终回到 64 并保持。
+            assert_eq!(nes.bus.dmc_output(), 64);
+            assert!(sample_reads(&mut nes).is_empty());
+            assert!(!nes.dmc_dma.is_busy());
+        }
+
+        #[test]
+        fn restart_preserves_old_buffer_then_refills_from_new_start() {
+            let mut nes = fixture(1);
+            write(&mut nes, 0x4015, 0x10);
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+            write(&mut nes, 0x4015, 0);
+            write(&mut nes, 0x4012, 3);
+            write(&mut nes, 0x4013, 0);
+            write(&mut nes, 0x4015, 0x10);
+            // 仍保留 $A5：不能立刻用新起点的 $3C 覆盖缓冲。
+            assert!(!nes.dmc_dma.is_busy());
+            assert!(nes.bus.dmc_active());
+            assert_eq!(nes.bus.dmc_next_sample_address(), None);
+            run_to(&mut nes, 2900);
+            assert!(sample_reads(&mut nes).is_empty());
+            run_to(&mut nes, 3100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC0C0]);
+            run_to(&mut nes, 3425);
+            assert_eq!(nes.bus.dmc_output(), 66); // 播放的是旧 $A5，不是新 $3C。
+        }
+
+        #[test]
+        fn disabling_clears_dmc_irq_but_keeps_output_level() {
+            let mut nes = fixture(0);
+            write(&mut nes, 0x4015, 0x10);
+            run_to(&mut nes, 100);
+            assert!(nes.bus.irq_line());
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x80, 0x80);
+            write(&mut nes, 0x4015, 0);
+            assert!(!nes.bus.irq_line());
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0);
+            assert_eq!(nes.bus.dmc_output(), 64);
         }
     }
 }
