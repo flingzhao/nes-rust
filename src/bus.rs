@@ -171,6 +171,14 @@ impl Bus {
     pub fn irq_line(&self) -> bool {
         self.apu.irq_line()
     }
+
+    pub(crate) fn dmc_next_sample_address(&self) -> Option<u16> {
+        self.apu.dmc_next_sample_address()
+    }
+
+    pub(crate) fn dmc_active(&self) -> bool {
+        self.apu.dmc_active()
+    }
 }
 
 #[cfg(test)]

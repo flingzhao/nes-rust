@@ -154,12 +154,26 @@ impl<'a> ClockedCpuBus<'a> {
 
         self.nmi_levels.extend(nmi_levels);
 
+        self.schedule_dmc_reload()?;
+
         *self.cpu_cycles = (*self.cpu_cycles).wrapping_add(1);
         Ok(())
     }
 
     fn take_nmi_levels(&mut self) -> Vec<bool> {
         std::mem::take(&mut self.nmi_levels)
+    }
+
+    fn schedule_dmc_reload(&mut self) -> Result<(), String> {
+        if self.dmc_dma.is_busy() {
+            return Ok(());
+        }
+
+        if let Some(sample_addr) = self.bus.dmc_next_sample_address() {
+            self.dmc_dma.request_reload(sample_addr)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -202,7 +216,17 @@ impl CpuBus for ClockedCpuBus<'_> {
         let action = self.dmc_dma.clock(phase, CpuBusCycle::Write);
         match action {
             DmcDmaAction::Pass => {
+                let former_dmc_active = self.bus.dmc_active();
                 self.bus.cpu_write(addr, value)?;
+                if addr == 0x4015
+                    && value & 0x10 != 0
+                    && !former_dmc_active
+                    && !self.dmc_dma.is_busy()
+                {
+                    if let Some(sample_addr) = self.bus.dmc_next_sample_address() {
+                        self.dmc_dma.request_load(sample_addr, phase)?;
+                    }
+                }
                 self.clock_one_cpu_cycle()?;
             }
             _ => unreachable!(),
@@ -1011,6 +1035,189 @@ mod tests {
             assert_eq!(nes.bus.dmc_output(), 64);
             nes.clock_one_cpu_cycle().unwrap();
             assert_eq!(nes.bus.dmc_output(), 66);
+        }
+    }
+
+    mod dmc_auto_request_tests {
+        use super::*;
+
+        fn fixture(program: &[u8], control: u8, length: u8) -> Nes {
+            assert!(program.len() < 0x80);
+            let mut rom = vec![0u8; 16 + 0x4000];
+            rom[..4].copy_from_slice(b"NES\x1A");
+            rom[4] = 1;
+            let prg = &mut rom[16..];
+            prg[..program.len()].copy_from_slice(program);
+            // 16 KiB NROM 镜像：PRG 偏移 $80 对应 CPU 地址 $C080。
+            prg[0x80] = 0xA5;
+            prg[0x81] = 0x3C;
+            prg[0x3FFC..0x3FFE].copy_from_slice(&0x8000u16.to_le_bytes());
+
+            let cartridge = Cartridge::try_from(rom.as_slice()).unwrap();
+            let mut bus = Bus::new();
+            bus.insert_cartridge(cartridge);
+            bus.cpu_write(0x0000, 0x10).unwrap();
+            bus.cpu_write(0x4010, control).unwrap();
+            bus.cpu_write(0x4011, 64).unwrap();
+            bus.cpu_write(0x4012, 2).unwrap(); // $C080。
+            bus.cpu_write(0x4013, length).unwrap();
+            bus.cpu_write(0x4017, 0x40).unwrap(); // 禁止 frame IRQ。
+            // 不在这里写 $4015；由下面的 CPU 程序启用 DMC。
+            let mut cpu = Cpu::new();
+            cpu.reset(&mut bus).unwrap();
+            bus.take_read_trace();
+            Nes::new(cpu, bus)
+        }
+
+        fn sample_reads(nes: &mut Nes) -> Vec<u16> {
+            nes.bus
+                .take_read_trace()
+                .into_iter()
+                .filter(|addr| (0xC080u16..=0xC090).contains(addr))
+                .collect()
+        }
+
+        fn run_to(nes: &mut Nes, target: u64) {
+            // 指令可能跨过 target；这些测试的时间边界留有足够余量。
+            for _ in 0..20_000 {
+                if nes.cpu_cycles() >= target {
+                    return;
+                }
+                nes.step().unwrap();
+            }
+            panic!("did not reach {target} CPU cycles");
+        }
+
+        fn enable_program() -> [u8; 8] {
+            // LDA #$10; STA $4015; JMP $8005。
+            [0xA9, 0x10, 0x8D, 0x15, 0x40, 0x4C, 0x05, 0x80]
+        }
+
+        #[test]
+        fn cpu_enable_schedules_load_with_both_write_phases() {
+            for (load_opcode, operand, load_cycles, after_write) in [
+                (0xA9u8, 0x10u8, 2u8, 6u64), // 写周期开始计数 5：Get。
+                (0xA5u8, 0x00u8, 3u8, 7u64), // 写周期开始计数 6：Put。
+            ] {
+                // LDA; STA $4015; NOP; NOP; JMP $8007。
+                let program = [
+                    load_opcode,
+                    operand,
+                    0x8D,
+                    0x15,
+                    0x40,
+                    0xEA,
+                    0xEA,
+                    0x4C,
+                    0x07,
+                    0x80,
+                ];
+                let mut nes = fixture(&program, 0x80, 0);
+                assert_eq!(nes.step().unwrap(), load_cycles);
+                assert_eq!(nes.step().unwrap(), 4);
+                assert_eq!(nes.cpu_cycles(), after_write);
+                assert!(nes.dmc_dma.is_busy());
+                assert!(sample_reads(&mut nes).is_empty());
+
+                // 两种相位下，写入后的第一个 NOP 都尚未被暂停。
+                assert_eq!(nes.step().unwrap(), 2);
+                assert_eq!(nes.cpu_cycles(), after_write + 2);
+                assert!(sample_reads(&mut nes).is_empty());
+
+                // 第二个 NOP 增加 3 个 DMA 停顿周期，但返回的指令周期仍为 2。
+                assert_eq!(nes.step().unwrap(), 2);
+                assert_eq!(nes.cpu_cycles(), after_write + 7);
+                assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+                assert!(!nes.dmc_dma.is_busy());
+                assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0x80);
+            }
+        }
+
+        #[test]
+        fn disabled_dmc_does_not_request_samples() {
+            // LDA #$00; STA $4015; JMP $8005。
+            let program = [0xA9, 0x00, 0x8D, 0x15, 0x40, 0x4C, 0x05, 0x80];
+            let mut nes = fixture(&program, 0x00, 1);
+            run_to(&mut nes, 4_000);
+            assert!(sample_reads(&mut nes).is_empty());
+            assert!(!nes.dmc_dma.is_busy());
+        }
+
+        #[test]
+        fn draining_buffer_automatically_fetches_next_byte() {
+            let mut nes = fixture(&enable_program(), 0x00, 1); // 17 字节，rate 0。
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+            assert!(!nes.dmc_dma.is_busy());
+
+            run_to(&mut nes, 2_900);
+            assert!(sample_reads(&mut nes).is_empty()); // 缓冲还没被取走。
+
+            run_to(&mut nes, 3_100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC081]);
+            assert!(!nes.dmc_dma.is_busy());
+
+            run_to(&mut nes, 6_000);
+            assert!(sample_reads(&mut nes).is_empty()); // 第二个字节仍在缓冲里。
+            run_to(&mut nes, 6_600);
+            assert_eq!(sample_reads(&mut nes), vec![0xC082]);
+        }
+
+        #[test]
+        fn final_byte_does_not_schedule_another_reload() {
+            let mut nes = fixture(&enable_program(), 0x80, 0); // 单字节、IRQ 开启。
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0x80);
+
+            run_to(&mut nes, 8_000);
+            assert!(sample_reads(&mut nes).is_empty());
+            assert!(!nes.dmc_dma.is_busy());
+        }
+
+        #[test]
+        fn looped_sample_reloads_only_when_buffer_is_empty() {
+            let mut nes = fixture(&enable_program(), 0x40, 0); // 单字节循环，无 IRQ。
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+
+            run_to(&mut nes, 2_900);
+            assert!(sample_reads(&mut nes).is_empty());
+            run_to(&mut nes, 3_100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x90, 0x10);
+        }
+
+        #[test]
+        fn repeated_enable_does_not_restart_active_sample() {
+            // LDA #$10; STA $4015; STA $4015; JMP $8008。
+            let program = [
+                0xA9, 0x10, 0x8D, 0x15, 0x40, 0x8D, 0x15, 0x40, 0x4C, 0x08, 0x80,
+            ];
+            let mut nes = fixture(&program, 0x00, 1);
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+            run_to(&mut nes, 3_100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC081]);
+        }
+
+        #[test]
+        fn restarting_with_full_buffer_waits_for_reload() {
+            // 第一字节已被读入缓冲，但尚未送入移位寄存器时再次启用。
+            // LDA #$10; STA $4015; NOP; NOP; STA $4015; JMP $800A。
+            let program = [
+                0xA9, 0x10, 0x8D, 0x15, 0x40, 0xEA, 0xEA, 0x8D, 0x15, 0x40, 0x4C, 0x0A, 0x80,
+            ];
+            let mut nes = fixture(&program, 0x00, 0);
+            run_to(&mut nes, 100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
+            assert!(!nes.dmc_dma.is_busy());
+            assert_eq!(nes.bus.cpu_read(0x4015).unwrap() & 0x10, 0x10);
+
+            run_to(&mut nes, 2_900);
+            assert!(sample_reads(&mut nes).is_empty());
+            run_to(&mut nes, 3_100);
+            assert_eq!(sample_reads(&mut nes), vec![0xC080]);
         }
     }
 }

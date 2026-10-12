@@ -148,4 +148,12 @@ impl Apu {
     pub(crate) fn complete_dmc_sample_read(&mut self, value: u8) -> Result<(), String> {
         self.dmc.complete_sample_read(value)
     }
+
+    pub(crate) fn dmc_next_sample_address(&self) -> Option<u16> {
+        self.dmc.next_sample_address()
+    }
+
+    pub(crate) fn dmc_active(&self) -> bool {
+        self.dmc.is_active()
+    }
 }
