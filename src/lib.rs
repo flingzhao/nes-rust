@@ -7,4 +7,5 @@ pub mod cpu_bus;
 pub mod debug_video;
 pub(crate) mod dmc_dma;
 pub mod nes;
+pub(crate) mod oam_dma;
 pub mod ppu;
