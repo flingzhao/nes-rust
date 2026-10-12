@@ -1,5 +1,6 @@
 pub mod dmc;
 pub mod frame_counter;
+pub mod mixer;
 pub mod noise;
 pub mod pulse;
 pub mod triangle;
@@ -9,6 +10,8 @@ use frame_counter::FrameCounter;
 use noise::NoiseChannel;
 use pulse::PulseChannel;
 use triangle::TriangleChannel;
+
+use mixer::ChannelLevels;
 
 pub struct Apu {
     pulses: [PulseChannel; 2],
@@ -155,5 +158,19 @@ impl Apu {
 
     pub(crate) fn dmc_active(&self) -> bool {
         self.dmc.is_active()
+    }
+
+    pub(crate) fn raw_levels(&self) -> ChannelLevels {
+        ChannelLevels {
+            pulse1: self.pulses[0].output(),
+            pulse2: self.pulses[1].output(),
+            triangle: self.triangle.output(),
+            noise: self.noise.output(),
+            dmc: self.dmc.output(),
+        }
+    }
+
+    pub(crate) fn mixed_output(&self) -> f32 {
+        mixer::mix(self.raw_levels())
     }
 }
