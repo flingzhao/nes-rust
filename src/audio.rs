@@ -1,3 +1,6 @@
+use std::f64::consts::PI;
+use std::f64::consts::TAU; // 2 * pi
+
 pub(crate) const NTSC_CPU_HZ: u32 = 1_789_773;
 pub(crate) const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
@@ -58,6 +61,90 @@ impl CpuRateSampler {
         }
 
         output
+    }
+}
+
+struct HighPass {
+    coefficient: f64,
+    previous_input: f64,
+    previous_output: f64,
+}
+
+struct LowPass {
+    coefficient: f64,
+    previous_output: f64,
+}
+
+impl HighPass {
+    fn new(sample_rate: u32, cutoff_hz: f64) -> Result<Self, String> {
+        if sample_rate == 0 {
+            return Err("sample_rate should be greater than 0.".to_string());
+        }
+
+        if !cutoff_hz.is_finite() || cutoff_hz <= 0.0 || cutoff_hz >= f64::from(sample_rate / 2) {
+            return Err("cutoff hz should be between 0 and sample_rate / 2.".to_string());
+        }
+        let q = TAU * f64::from(cutoff_hz) / f64::from(sample_rate);
+        let coefficient = 1.0 / (1.0 + q);
+        Ok(Self {
+            coefficient,
+            previous_input: 0.0,
+            previous_output: 0.0,
+        })
+    }
+
+    fn process(&mut self, input: f64) -> f64 {
+        let output = self.coefficient * (self.previous_output + input - self.previous_input);
+        self.previous_input = input;
+        self.previous_output = output;
+        self.previous_output
+    }
+}
+
+impl LowPass {
+    fn new(sample_rate: u32, cutoff_hz: f64) -> Result<Self, String> {
+        if sample_rate == 0 {
+            return Err("sample_rate should be greater than 0.".to_string());
+        }
+
+        if !cutoff_hz.is_finite() || cutoff_hz <= 0.0 || cutoff_hz >= f64::from(sample_rate / 2) {
+            return Err("cutoff hz should be between 0 and sample_rate / 2.".to_string());
+        }
+        let q = TAU * f64::from(cutoff_hz) / f64::from(sample_rate);
+        let coefficient = q / (1.0 + q);
+        Ok(Self {
+            coefficient,
+            previous_output: 0.0,
+        })
+    }
+
+    fn process(&mut self, input: f64) -> f64 {
+        let output = self.previous_output + self.coefficient * (input - self.previous_output);
+        self.previous_output = output;
+        self.previous_output
+    }
+}
+
+pub(crate) struct AudioFilter {
+    high_pass_90: HighPass,
+    high_pass_440: HighPass,
+    low_pass_14000: LowPass,
+}
+
+impl AudioFilter {
+    pub(crate) fn new(sample_rate: u32) -> Result<Self, String> {
+        Ok(Self {
+            high_pass_90: HighPass::new(sample_rate, 90.0)?,
+            high_pass_440: HighPass::new(sample_rate, 440.0)?,
+            low_pass_14000: LowPass::new(sample_rate, 14_000.0)?,
+        })
+    }
+
+    pub(crate) fn process(&mut self, input: f32) -> f32 {
+        let mut output = self.high_pass_90.process(f64::from(input));
+        output = self.high_pass_440.process(output);
+        output = self.low_pass_14000.process(output);
+        output as f32
     }
 }
 
@@ -191,6 +278,7 @@ mod audio_sampler_tests {
 
     #[test]
     fn bus_samples_the_mixed_level_and_preserves_fractional_history() {
+        let mut filter = super::AudioFilter::new(AUDIO_SAMPLE_RATE).unwrap();
         let mut bus = bus_with_program(&[0xEA]);
         let low = bus.apu().mixed_output();
         clock(&mut bus, 20);
@@ -204,11 +292,11 @@ mod audio_sampler_tests {
         let expected = (f64::from(low) * low_units
             + f64::from(high) * (f64::from(NTSC_CPU_HZ) - low_units))
             / f64::from(NTSC_CPU_HZ);
-        close(samples[0], expected as f32);
+        close(samples[0], filter.process(expected as f32));
         clock(&mut bus, 37); // total 75 cycles
         let samples = bus.take_audio_samples();
         assert_eq!(samples.len(), 1);
-        close(samples[0], high);
+        close(samples[0], filter.process(high));
     }
 
     #[test]
@@ -228,5 +316,167 @@ mod audio_sampler_tests {
         assert_eq!(samples.len(), 13);
         assert!(samples.iter().all(|v| v.is_finite()));
         assert!(nes.take_audio_samples().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audio_filter_tests {
+    use super::{AUDIO_SAMPLE_RATE, AudioFilter, CpuRateSampler, HighPass, LowPass, NTSC_CPU_HZ};
+    use crate::{bus::Bus, cartridge::Cartridge};
+
+    fn close(actual: f64, expected: f64, tolerance: f64) {
+        assert!(actual.is_finite());
+        assert!(
+            (actual - expected).abs() < tolerance,
+            "actual={actual}, expected={expected}, tolerance={tolerance}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_filter_parameters() {
+        assert!(HighPass::new(0, 90.0).is_err());
+        assert!(LowPass::new(0, 90.0).is_err());
+        for cutoff in [
+            0.0,
+            -1.0,
+            24_000.0,
+            30_000.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(HighPass::new(48_000, cutoff).is_err());
+            assert!(LowPass::new(48_000, cutoff).is_err());
+        }
+        for rate in [0, 8_000, 28_000] {
+            assert!(AudioFilter::new(rate).is_err());
+        }
+        assert!(AudioFilter::new(44_100).is_ok());
+        assert!(AudioFilter::new(48_000).is_ok());
+    }
+
+    #[test]
+    fn high_pass_remembers_both_previous_input_and_output() {
+        let mut filter = HighPass::new(48_000, 90.0).unwrap();
+        let a = 1.0 / (1.0 + std::f64::consts::TAU * 90.0 / 48_000.0);
+        close(filter.process(1.0), a, 1e-12);
+        close(filter.process(1.0), a * a, 1e-12);
+        close(filter.process(0.0), a * (a * a - 1.0), 1e-12);
+    }
+
+    #[test]
+    fn low_pass_moves_toward_input_without_immediately_replacing_output() {
+        let mut filter = LowPass::new(48_000, 14_000.0).unwrap();
+        let q = std::f64::consts::TAU * 14_000.0 / 48_000.0;
+        let b = q / (1.0 + q);
+        let first = b;
+        let second = first + b * (1.0 - first);
+        close(filter.process(1.0), first, 1e-12);
+        close(filter.process(1.0), second, 1e-12);
+        close(filter.process(0.0), second * (1.0 - b), 1e-12);
+    }
+
+    #[test]
+    fn zero_input_stays_zero() {
+        let mut filter = AudioFilter::new(48_000).unwrap();
+        for _ in 0..1000 {
+            assert_eq!(filter.process(0.0), 0.0);
+        }
+    }
+
+    #[test]
+    fn cascade_matches_known_startup_values() {
+        let mut filter = AudioFilter::new(48_000).unwrap();
+        for expected in [
+            0.30230534446255963,
+            0.38904583150381944,
+            0.40081405349886706,
+        ] {
+            close(f64::from(filter.process(0.5)), expected, 1e-6);
+        }
+    }
+
+    #[test]
+    fn constant_input_decays_toward_zero() {
+        let mut filter = AudioFilter::new(48_000).unwrap();
+        let mut output = 0.0;
+        for _ in 0..4800 {
+            output = filter.process(0.5);
+        }
+        assert!(output.abs() < 1e-6, "output={output}");
+    }
+
+    #[test]
+    fn negative_values_are_preserved_and_not_clamped() {
+        let mut positive = AudioFilter::new(48_000).unwrap();
+        let mut negative = AudioFilter::new(48_000).unwrap();
+        for i in 0..1000 {
+            let x = if i < 100 { 0.5 } else { 0.0 };
+            close(
+                f64::from(negative.process(-x)),
+                -f64::from(positive.process(x)),
+                1e-6,
+            );
+        }
+        let mut filter = AudioFilter::new(48_000).unwrap();
+        assert!(filter.process(-0.5) < 0.0);
+    }
+
+    #[test]
+    fn high_pass_retains_changes_while_low_pass_reduces_fast_changes() {
+        let mut high = HighPass::new(48_000, 90.0).unwrap();
+        let mut low = LowPass::new(48_000, 14_000.0).unwrap();
+        let mut high_output = 0.0;
+        let mut low_output = 0.0;
+        for i in 0..4800 {
+            let input = if i % 2 == 0 { 1.0 } else { -1.0 };
+            high_output = high.process(input);
+            low_output = low.process(input);
+        }
+        assert!(high_output.abs() > 0.9);
+        assert!(low_output.abs() < 0.6);
+    }
+
+    fn bus_with_cartridge() -> Bus {
+        let mut rom = vec![0u8; 16 + 0x4000];
+        rom[..4].copy_from_slice(b"NES\x1A");
+        rom[4] = 1;
+        let mut bus = Bus::new();
+        bus.insert_cartridge(Cartridge::try_from(rom.as_slice()).unwrap());
+        bus.cpu_write(0x2001, 0).unwrap();
+        bus.cpu_write(0x4017, 0x40).unwrap();
+        bus
+    }
+
+    #[test]
+    fn bus_filters_once_per_sample_and_draining_preserves_all_history() {
+        let mut bus = bus_with_cartridge();
+        let mut sampler = CpuRateSampler::new(NTSC_CPU_HZ, AUDIO_SAMPLE_RATE).unwrap();
+        let mut filter = AudioFilter::new(AUDIO_SAMPLE_RATE).unwrap();
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        for cycle in 0..10_000u32 {
+            if cycle % 113 == 0 {
+                bus.cpu_write(0x4011, ((cycle / 113) % 128) as u8).unwrap();
+            }
+            bus.clock_cpu_cycle().unwrap();
+            let level = bus.apu().mixed_output();
+            if let Some(sample) = sampler.push_cycle(level) {
+                expected.push(filter.process(sample));
+            }
+            if cycle % 37 == 0 {
+                actual.extend(bus.take_audio_samples());
+            }
+        }
+        actual.extend(bus.take_audio_samples());
+        assert_eq!(
+            actual.len(),
+            (10_000u64 * u64::from(AUDIO_SAMPLE_RATE) / u64::from(NTSC_CPU_HZ)) as usize
+        );
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.into_iter().zip(expected) {
+            close(f64::from(a), f64::from(e), 1e-6);
+        }
+        assert!(bus.take_audio_samples().is_empty());
     }
 }

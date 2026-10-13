@@ -1,5 +1,5 @@
 use crate::apu::Apu;
-use crate::audio::CpuRateSampler;
+use crate::audio::{AUDIO_SAMPLE_RATE, AudioFilter, CpuRateSampler};
 use crate::cartridge::Cartridge;
 use crate::controller::{Button, Controller};
 use crate::ppu::Ppu;
@@ -18,6 +18,7 @@ pub struct Bus {
     apu: Apu,
     audio_sampler: CpuRateSampler,
     audio_samples: Vec<f32>,
+    audio_filter: AudioFilter,
 
     #[cfg(test)]
     write_trace: Vec<(u16, u8)>,
@@ -44,6 +45,7 @@ impl Bus {
             )
             .expect(""),
             audio_samples: Vec::<f32>::new(),
+            audio_filter: AudioFilter::new(crate::audio::AUDIO_SAMPLE_RATE).expect(""),
         }
     }
 
@@ -150,7 +152,8 @@ impl Bus {
 
         let level = self.apu.mixed_output();
         if let Some(sample) = self.audio_sampler.push_cycle(level) {
-            self.audio_samples.push(sample);
+            let filtered = self.audio_filter.process(sample);
+            self.audio_samples.push(filtered);
         }
 
         Ok(levels)
