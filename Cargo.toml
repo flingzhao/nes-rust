@@ -14,3 +14,8 @@ sdl2 = { version = "0.38", optional = true, features = ["bundled", "static-link"
 name = "pattern-viewer"
 path = "src/bin/pattern_viewer.rs"
 required-features = ["desktop"]
+
+[[bin]]
+name = "nes"
+path = "src/bin/nes.rs"
+required-features = ["desktop"]

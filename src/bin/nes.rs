@@ -1,3 +1,4 @@
+use sdl2::audio::AudioSpecDesired;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
@@ -8,6 +9,13 @@ use nes::cartridge::Cartridge;
 use nes::controller::Button;
 use nes::cpu::Cpu;
 use nes::nes::Nes;
+
+#[path = "support/audio_playback.rs"]
+mod audio_playback;
+
+use audio_playback::{PlaybackAction, PlaybackPolicy, prepare_output};
+
+const PLAYBACK_GAIN: f32 = 0.25;
 
 const DISPLAY_PALETTE: [u32; 64] = [
     0x808080, 0x003DA6, 0x0012B0, 0x440096, 0xA1005E, 0xC70028, 0xBA0600, 0x8C1700, 0x5C2F00,
@@ -62,6 +70,31 @@ fn map_button(key: Keycode) -> Option<Button> {
 fn run_window(mut nes: Nes) -> Result<(), String> {
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
+    let audio = sdl.audio()?;
+    let sample_rate = nes.audio_sample_rate();
+    let frequency =
+        i32::try_from(sample_rate).map_err(|_| "Audio sample rate exceeds i32".to_string())?;
+    let desired = AudioSpecDesired {
+        freq: Some(frequency),
+        channels: Some(1),
+        samples: Some(1024),
+    };
+    let audio_queue = audio.open_queue::<f32, _>(None, &desired)?;
+    let actual = audio_queue.spec();
+    if actual.freq != frequency || actual.channels != 1 {
+        return Err(format!(
+            "Unexpected audio format: {} Hz, {} channels; expected {sample_rate} Hz, mono",
+            actual.freq, actual.channels,
+        ));
+    }
+    eprintln!(
+        "Audio: {} Hz, {} channel(s), device buffer {} samples",
+        actual.freq, actual.channels, actual.samples,
+    );
+    // 新设备保持暂停：积累 40 ms 声音后才开始播放。
+    let mut playback = PlaybackPolicy::new(sample_rate)?;
+    let audio_debug = std::env::var_os("NES_AUDIO_DEBUG").is_some();
+    let mut last_audio_report = Instant::now();
 
     // 使用整数倍窗口；不使用线性过滤模糊像素。
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
@@ -72,7 +105,7 @@ fn run_window(mut nes: Nes) -> Result<(), String> {
         .build()
         .map_err(|error| error.to_string())?;
 
-    // 本轮用软件限速，不同时依赖显示器垂直同步。
+    // 用音频队列控制模拟速度，不叠加垂直同步或固定帧率等待。
     let mut canvas = window
         .into_canvas()
         .build()
@@ -90,12 +123,7 @@ fn run_window(mut nes: Nes) -> Result<(), String> {
     let mut events = sdl.event_pump()?;
     let mut rgb = vec![0u8; 256 * 240 * 3];
 
-    // 临时显示限速；后续音频阶段再统一处理同步策略。
-    let frame_duration = Duration::from_secs_f64(1.0 / 60.0988);
-
     'running: loop {
-        let started = Instant::now();
-
         for event in events.poll_iter() {
             use sdl2::event::WindowEvent;
 
@@ -135,7 +163,28 @@ fn run_window(mut nes: Nes) -> Result<(), String> {
             }
         }
 
-        // nes.run_until_frame()?;
+        // 先处理事件，再判断是否等待，避免队列满时窗口不响应。
+        // size() 是字节数；单声道 f32 的每个样本占 4 字节。
+        let queued_bytes = audio_queue.size();
+        if audio_debug && last_audio_report.elapsed() >= Duration::from_secs(1) {
+            let queued_ms = f64::from(queued_bytes) * 1000.0
+                / (f64::from(sample_rate) * std::mem::size_of::<f32>() as f64);
+            eprintln!("Audio queue: {queued_bytes} bytes ({queued_ms:.1} ms)");
+            last_audio_report = Instant::now();
+        }
+        match playback.update(queued_bytes) {
+            PlaybackAction::Start => {
+                audio_queue.resume();
+                continue;
+            }
+            PlaybackAction::Wait => {
+                // 只等待宿主时间，不额外推进 CPU/PPU/APU。
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            PlaybackAction::Fill | PlaybackAction::Run => {}
+        }
+
         if let Err(error) = nes.run_until_frame() {
             eprintln!(
                 "NES execution failed at CPU cycle {}: {}",
@@ -143,6 +192,11 @@ fn run_window(mut nes: Nes) -> Result<(), String> {
                 error
             );
             return Err(error);
+        }
+        let samples = nes.take_audio_samples();
+        let output = prepare_output(&samples, PLAYBACK_GAIN)?;
+        if !output.is_empty() {
+            audio_queue.queue_audio(&output)?;
         }
         indices_to_rgb(nes.framebuffer(), &mut rgb)?;
 
@@ -153,19 +207,16 @@ fn run_window(mut nes: Nes) -> Result<(), String> {
         canvas.clear();
         canvas.copy(&texture, None, None)?;
         canvas.present();
-
-        if let Some(remaining) = frame_duration.checked_sub(started.elapsed()) {
-            std::thread::sleep(remaining);
-        }
     }
 
+    audio_queue.pause();
     Ok(())
 }
 
 fn main() -> Result<(), String> {
     let path = std::env::args_os()
         .nth(1)
-        .ok_or_else(|| "Usage: pattern-viewer <rom.nes>".to_string())?;
+        .ok_or_else(|| "Usage: nes <rom.nes>".to_string())?;
 
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let cartridge = Cartridge::try_from(bytes.as_slice())?;
@@ -176,8 +227,6 @@ fn main() -> Result<(), String> {
     let mut cpu = Cpu::new();
     cpu.reset(&mut bus)?;
 
-    let mut nes = Nes::new(cpu, bus);
-    run_window(nes);
-
-    Ok(())
+    let nes = Nes::new(cpu, bus);
+    run_window(nes)
 }

@@ -79,6 +79,10 @@ impl Bus {
 
                 cartridge.cpu_read(addr)
             }
+            0x4000..=0x4014 => {
+                // TODO: implement cpu open bus behaviour
+                Ok(0)
+            }
             _ => Err(format!("unimplemented addr access: {addr:#04X}")),
             // _ => Ok(0),
         }

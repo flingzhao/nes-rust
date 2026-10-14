@@ -130,6 +130,10 @@ impl Nes {
     pub fn take_audio_samples(&mut self) -> Vec<f32> {
         self.bus.take_audio_samples()
     }
+
+    pub fn audio_sample_rate(&self) -> u32 {
+        crate::audio::AUDIO_SAMPLE_RATE
+    }
 }
 
 struct ClockedCpuBus<'a> {
